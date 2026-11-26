@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: ${{ matrix.cxx }} / ${{ matrix.config }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++-13, clang++-18]
+        config: [release, asan-ubsan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ${{ startsWith(matrix.cxx, 'clang') && 'clang-18 libclang-rt-18-dev' || 'g++-13' }}
+          python3 -m pip install --user --break-system-packages scapy
+
+      - name: configure
+        run: |
+          if [ "${{ matrix.config }}" = "asan-ubsan" ]; then
+            EXTRA="-DCMAKE_BUILD_TYPE=Debug -DNANOWIRE_SANITIZER=address,undefined"
+          else
+            EXTRA="-DCMAKE_BUILD_TYPE=Release"
+          fi
+          cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DNANOWIRE_WERROR=ON $EXTRA
+
+      - name: build
+        run: cmake --build build -j "$(getconf _NPROCESSORS_ONLN)"
+
+      - name: test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build --output-on-failure -j "$(getconf _NPROCESSORS_ONLN)"
+
+      - name: bench smoke (generated capture)
+        if: matrix.config == 'release'
+        run: |
+          python3 bench/gen_capture.py build/bench.pcap 200000
+          ./build/bench/packet_walk_bench build/bench.pcap 3
+          ./build/bench/build_frame_bench all 200000 3

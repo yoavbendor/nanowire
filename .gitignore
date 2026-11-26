@@ -1,0 +1,8 @@
+build/
+build-*/
+.deps*/
+compile_commands.json
+.cache/
+__pycache__/
+*.pcap.tmp
+callgrind.out.*

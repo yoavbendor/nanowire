@@ -1,0 +1,7 @@
+nanowire
+Copyright 2026 Yoav Bendor and the nanowire contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+nanowire depends on nanom (https://github.com/yoavbendor/nanom, Apache-2.0), fetched at build time.
+It has no other third-party dependencies.
