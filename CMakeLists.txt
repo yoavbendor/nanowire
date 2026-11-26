@@ -32,7 +32,7 @@ endif()
 #   cmake -B build -DFETCHCONTENT_SOURCE_DIR_NANOM=/path/to/nanom
 # An embedding project that already provides the nanom::nanom target wins (no second copy).
 set(NANOWIRE_NANOM_GIT_URL "https://github.com/yoavbendor/nanom.git" CACHE STRING "nanom repository")
-set(NANOWIRE_NANOM_GIT_TAG "0dc07ab3dccd58ea677b512cbcd61104966ed085" CACHE STRING "nanom commit")
+set(NANOWIRE_NANOM_GIT_TAG "16f8ec1d1113bb6b99160949d1a9b87dcf88c374" CACHE STRING "nanom commit")
 if(NOT TARGET nanom::nanom)
   include(FetchContent)
   FetchContent_Declare(nanom
