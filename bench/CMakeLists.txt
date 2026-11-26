@@ -4,3 +4,6 @@ if(TARGET nanom::shark)
   target_link_libraries(packet_walk_bench PRIVATE nanom::shark)
   target_compile_definitions(packet_walk_bench PRIVATE NANOWIRE_BENCH_HAVE_SHARK=1)
 endif()
+
+add_executable(build_frame_bench build_frame_bench.cpp)
+target_link_libraries(build_frame_bench PRIVATE nanowire::nanowire nanowire_dev_flags)

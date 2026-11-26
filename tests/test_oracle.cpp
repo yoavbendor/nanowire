@@ -52,6 +52,7 @@ kvmap describe(const packet& pkt) {
   if (auto ip = pkt.ipv4()) {
     set("ip.ihl", ip->ihl()), set("ip.dscp", ip->dscp()), set("ip.ecn", ip->ecn()), set("ip.len", ip->total_length());
     set("ip.id", ip->identification()), set("ip.df", int(ip->df())), set("ip.mf", int(ip->mf()));
+    set("ip.rsv", int(ip->reserved()));
     set("ip.frag", ip->frag_offset()), set("ip.ttl", ip->ttl()), set("ip.proto", ip->protocol());
     set("ip.chksum", ip->checksum()), set("ip.src", to_string(ip->src())), set("ip.dst", to_string(ip->dst()));
   }
@@ -274,6 +275,17 @@ int build_mode(const char* pcap, const char* kvpath) {
       sd_option::ipv4_sd_endpoint(ip4("10.0.0.9")),         sd_option::ipv6_sd_endpoint(ip6("fd00::9"))};
   add(eth{.dst = dst, .src = src()}, ipv4{}, udp{.src_port = 30490, .dst_port = 30490}, someip_sd_header(3),
       someip_sd{.entries = entries, .options = options});
+  // the same kind of SD message from the fixed-size layers (one wire struct each)
+  add(eth{.dst = dst, .src = src()}, ipv4{}, udp{.src_port = 30490, .dst_port = 30490}, someip_sd_header(4),
+      sd_header{.flags = sd_flag::reboot}, sd_service_entry::offer_service(0x2222, 3, 1, 9).with_options(0, 1, 1, 1),
+      sd_eventgroup_entry::subscribe(0x2222, 3, 1, 0x10, 30, 2).with_options(2, 1),
+      sd_eventgroup_entry::subscribe_nack(0x2222, 3, 1, 0x11), sd_service_entry::find_service(0x3333), sd_options_length{},
+      sd_ipv4_option::endpoint(ip4("10.0.0.5"), ip_proto::tcp, 30509), sd_load_balancing_option{.priority = 3, .weight = 4},
+      sd_ipv6_option::sd_endpoint(ip6("fd00::5")));
+  // SOME/IP-TP header as its own layer; the IPv4 reserved ("evil") flag bit
+  add(eth{.dst = dst, .src = src()}, ipv4{.reserved = true}, udp{.src_port = 30501, .dst_port = 30501},
+      someip{.service_id = 0x1234, .method_id = 0x8004, .session_id = 5}, someip_tp{.offset = 4176, .more = true},
+      raw{bytes(pl).first(48)});
   static const std::array<std::byte, 3> abc{std::byte{'a'}, std::byte{'b'}, std::byte{'c'}};
   add(eth{.dst = dst, .src = src()}, ipv4{}, udp{.src_port = 50000, .dst_port = pdu_port}, soad_pdu{.id = 0x100, .data = abc},
       soad_pdu{.id = 0xdeadbeef}, soad_pdu{.id = 7, .data = bytes(pl).first(20)});

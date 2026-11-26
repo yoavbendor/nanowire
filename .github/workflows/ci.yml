@@ -51,3 +51,4 @@ jobs:
         run: |
           python3 bench/gen_capture.py build/bench.pcap 200000
           ./build/bench/packet_walk_bench build/bench.pcap 3
+          ./build/bench/build_frame_bench all 200000 3

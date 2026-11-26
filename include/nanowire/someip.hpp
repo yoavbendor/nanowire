@@ -6,7 +6,7 @@
 //   someip_tp_view                           the TP header (offset in 16-byte units, More flag)
 //   someip_messages                          zero-copy range over messages packed back to back in
 //                                            one UDP / TCP payload
-//   someip / someip_tp                       builders
+//   someip / someip_tp                       builders (someip_tp is also a 4-byte layer of its own)
 //
 // SOME/IP has no magic number: whether a UDP payload IS SOME/IP is port configuration (see
 // dispatch.hpp). Service Discovery (service 0xFFFF, method 0x8100) is in someip_sd.hpp;
@@ -184,15 +184,28 @@ class someip_messages {
 // builders
 // ---------------------------------------------------------------------------------------------
 
-/// The SOME/IP-TP header values for one segment (offset in BYTES; must be a multiple of 16).
+/// The SOME/IP-TP header [offset:28 (16-byte units)][reserved:3][more:1]. Offset in BYTES (must
+/// be a multiple of 16). Two uses:
+///   * a layer of its own, right after a someip{} layer: someip{...}, someip_tp{.offset = 1392,
+///     .more = true}, raw{segment}. It announces the TP flag, which the someip header ORs into its
+///     message_type; the someip length covers the TP header and the segment.
+///   * the value of someip{.tp = ...} (one 20-byte layer).
 struct someip_tp {
   u32 offset = 0;
   bool more = false;
+  u8 reserved = 0;  // 3 bits, must be zero on the wire
+
+  static constexpr std::size_t size() noexcept { return 4; }
+  static constexpr u8 someip_type_flags() noexcept { return someip_type::tp_flag; }
+  constexpr bool write(std::byte* p, const build_ctx& = {}) const noexcept {
+    if (offset % 16 != 0) return false;
+    return emit_wire(wire::someip_tp_hdr{{offset / 16}, {reserved}, {u8(more)}}, p) == 4;
+  }
 };
 
 /// SOME/IP header. `length` is derived (8 + everything after the header, TP header included)
 /// unless overridden. With `tp` set, the TP flag is OR-ed into message_type and the 4-byte TP
-/// header follows the 16-byte header.
+/// header follows the 16-byte header. A following someip_tp{} layer ORs the TP flag in as well.
 struct someip {
   u16 service_id = 0;
   u16 method_id = 0;
@@ -207,20 +220,10 @@ struct someip {
 
   constexpr std::size_t size() const noexcept { return tp ? 20 : 16; }
   constexpr bool write(std::byte* p, const build_ctx& c) const noexcept {
-    wire::someip_hdr h{service_id,
-                       method_id,
-                       0,
-                       client_id,
-                       session_id,
-                       protocol_version,
-                       interface_version,
-                       u8(tp ? (message_type | someip_type::tp_flag) : message_type),
+    const u8 type = u8(message_type | c.next_someip_type_flags | (tp ? someip_type::tp_flag : 0));
+    wire::someip_hdr h{service_id, method_id, 0, client_id, session_id, protocol_version, interface_version, type,
                        return_code};
-    if (tp) {
-      if (tp->offset % 16 != 0) return false;
-      wire::someip_tp_hdr t{{tp->offset / 16}, {0}, {u8(tp->more)}};
-      if (emit_wire(t, p + 16) != 4) return false;
-    }
+    if (tp && !tp->write(p + 16)) return false;
     if (emit_wire(h, p, length ? bytes{} : bytes(p + 16, (tp ? 4 : 0) + c.after)) != 16) return false;
     if (length) detail::put_be32(p + 4, *length);
     return true;

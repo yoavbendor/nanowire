@@ -73,7 +73,8 @@ def describe(pkt):
     if IP in pkt:
         ip = pkt[IP]
         kv.update({'ip.ihl': ip.ihl, 'ip.dscp': ip.tos >> 2, 'ip.ecn': ip.tos & 3, 'ip.len': ip.len, 'ip.id': ip.id,
-                   'ip.df': int(bool(ip.flags.DF)), 'ip.mf': int(bool(ip.flags.MF)), 'ip.frag': ip.frag,
+                   'ip.df': int(bool(ip.flags.DF)), 'ip.mf': int(bool(ip.flags.MF)),
+                   'ip.rsv': int(bool(ip.flags.evil)), 'ip.frag': ip.frag,
                    'ip.ttl': ip.ttl, 'ip.proto': ip.proto, 'ip.chksum': ip.chksum, 'ip.src': ip.src, 'ip.dst': ip.dst})
     if IPv6 in pkt:
         ip = pkt[IPv6]
@@ -220,6 +221,8 @@ def gen(out_pcap, out_kv):
         SDOption_IP6_SD_EndPoint(addr='fd00::9', l4_proto=17, port=30490)])
     pk.append(eth() / IP() / UDP(sport=30490, dport=30490)
               / SOMEIP(srv_id=0xFFFF, sub_id=0x8100, msg_type=2, client_id=0, session_id=3) / sd)
+    pk.append(eth() / IP(flags='evil+DF', id=r.randrange(0x10000)) / UDP(sport=30501, dport=30501)
+              / someip(msg_type=0x22, offset=4176, more_seg=1) / payload(48))
     pk.append(eth() / IP() / UDP(sport=50000, dport=PDU_PORT)
               / PDUTransport(pdus=[PDU(pdu_id=0x100) / Raw(b'abc'), PDU(pdu_id=0xdeadbeef) / Raw(b''),
                                    PDU(pdu_id=7) / Raw(bytes(range(20)))]))

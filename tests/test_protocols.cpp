@@ -646,4 +646,210 @@ TEST(regression_someip_overflow_and_sd_config) {
   CHECK_EQ(sd_encode_config(bad_items, cfg), 0u);
 }
 
+// ---- fixed-size builders (one wire struct each) and builder consistency -------------------------
+
+TEST(ipv4_reserved_evil_bit) {
+  auto f = frame(eth{}, ipv4{.src = ip4("10.0.0.1"), .dst = ip4("10.0.0.2"), .reserved = true, .df = true}, udp{});
+  auto ip = packet::parse(f).ipv4();
+  CHECK(ip && ip->reserved() && ip->df() && !ip->mf());
+  CHECK_EQ(u8(f[14 + 6]), 0xC0);  // flags: reserved | DF
+  CHECK(ip->checksum_ok());
+  auto g = frame(eth{}, ipv4{}, udp{});
+  CHECK(!packet::parse(g).ipv4()->reserved());
+  // patchable by the wire field name
+  std::byte* p = g.data() + 14;
+  CHECK(patch<wire::ipv4_hdr, "reserved">(p, 1));
+  CHECK(ipv4_view::parse(bytes(p, 20))->reserved());
+}
+
+TEST(someip_tp_as_its_own_layer) {
+  const std::array<std::byte, 32> pl{std::byte{7}};
+  const someip h{.service_id = 0x1234, .method_id = 0x8003, .session_id = 9};
+  someip with_tp = h;
+  with_tp.tp = someip_tp{.offset = 1392, .more = true};
+  auto a = frame(eth{}, ipv4{}, udp{}, with_tp, raw{pl});
+  auto b = frame(eth{}, ipv4{}, udp{}, h, someip_tp{.offset = 1392, .more = true}, raw{pl});
+  CHECK(a == b);
+  auto m = packet::parse(b).someip();
+  CHECK(m && m->is_tp() && m->length() == 8u + 4 + 32);
+  CHECK(m->tp()->offset_bytes() == 1392u && m->tp()->more());
+  // size / write like every other layer; reserved bits; misaligned offsets refused
+  static_assert(layer<someip_tp>);
+  CHECK_EQ(someip_tp::size(), 4u);
+  std::array<std::byte, 4> t{};
+  CHECK(someip_tp{.offset = 32, .more = false, .reserved = 5}.write(t.data()));
+  CHECK_EQ(someip_tp_view(t.data(), 4).reserved(), 5);
+  CHECK_EQ(someip_tp_view(t.data(), 4).offset_bytes(), 32u);
+  CHECK(!someip_tp{.offset = 17}.write(t.data(), build_ctx{}));
+  CHECK(!someip_tp{.reserved = 8}.write(t.data()));
+  CHECK(!make_frame(someip{}, someip_tp{.offset = 8}));
+}
+
+TEST(sd_fixed_size_layers_match_someip_sd) {
+  const std::array<sd_entry, 3> entries{
+      sd_entry::offer_service(0x1234, 1, 2, 3).with_options(0, 2),
+      sd_entry::subscribe(0x1234, 1, 2, 0x4455, 3, 7).with_options(2, 1),
+      sd_entry::find_service(0x1111),
+  };
+  const std::array<sd_option, 3> options{
+      sd_option::ipv4_endpoint(ip4("10.0.0.1"), ip_proto::udp, 30501),
+      sd_option::ipv6_endpoint(ip6("fd00::1"), ip_proto::tcp, 30503),
+      sd_option::load_balancing(1, 2),
+  };
+  auto a = frame(eth{}, ipv4{}, udp{.src_port = 30490, .dst_port = 30490}, someip_sd_header(7),
+                 someip_sd{.entries = entries, .options = options});
+  auto b = frame(eth{}, ipv4{}, udp{.src_port = 30490, .dst_port = 30490}, someip_sd_header(7), sd_header{},
+                 sd_service_entry::offer_service(0x1234, 1, 2, 3).with_options(0, 2),
+                 sd_eventgroup_entry::subscribe(0x1234, 1, 2, 0x4455, 3, 7).with_options(2, 1),
+                 sd_service_entry::find_service(0x1111), sd_options_length{},
+                 sd_ipv4_option::endpoint(ip4("10.0.0.1"), ip_proto::udp, 30501),
+                 sd_ipv6_option::endpoint(ip6("fd00::1"), ip_proto::tcp, 30503),
+                 sd_load_balancing_option{.priority = 1, .weight = 2});
+  CHECK(a == b);
+  auto sd = sd_view::parse(*packet::parse(b).someip());
+  CHECK(sd && sd->well_formed());
+  CHECK_EQ(sd->entries_length(), 48u);
+  CHECK_EQ(sd->options_length(), 12u + 24 + 8);
+  CHECK_EQ(sd->options().count(), 3u);
+  // the runtime-typed entries / options are written through the typed builders
+  for (const auto& e : entries) {
+    std::array<std::byte, 16> x{}, y{};
+    CHECK(e.write(x.data(), build_ctx{}));
+    CHECK(e.is_eventgroup() ? e.as_eventgroup().write(y.data()) : e.as_service().write(y.data()));
+    CHECK(x == y);
+  }
+  for (const auto& o : options) {
+    std::array<std::byte, 24> x{}, y{};
+    CHECK(o.write(x.data(), build_ctx{}));
+    CHECK(o.is_v4() ? o.as_ipv4().write(y.data()) : o.is_v6() ? o.as_ipv6().write(y.data()) : o.as_load_balancing().write(y.data()));
+    CHECK(x == y);
+  }
+  static_assert(layer<sd_entry> && layer<sd_option> && layer<sd_header> && layer<sd_options_length> &&
+                layer<sd_service_entry> && layer<sd_eventgroup_entry> && layer<sd_ipv4_option> &&
+                layer<sd_ipv6_option> && layer<sd_load_balancing_option>);
+}
+
+TEST(sd_header_and_options_length_derivation) {
+  // entries_length covers only the run of entry layers right after the header
+  auto f = *make_frame(sd_header{.flags = sd_flag::reboot}, sd_eventgroup_entry::subscribe_nack(1, 2, 3, 4),
+                       sd_options_length{}, sd_ipv4_option::sd_endpoint(ip4("10.0.0.9")), fill{.count = 5});
+  CHECK_EQ(f.size(), 8u + 16 + 4 + 12 + 5);
+  CHECK_EQ(u8(f[0]), sd_flag::reboot);
+  CHECK_EQ(detail::be32(f.data() + 4), 16u);
+  CHECK_EQ(detail::be32(f.data() + 24), 12u + 5);  // options length = everything after it
+  // no entry layers: 0 unless overridden (entries carried as raw bytes)
+  const std::array<std::byte, 32> ent{};
+  auto g = *make_frame(sd_header{}, raw{ent});
+  CHECK_EQ(detail::be32(g.data() + 4), 0u);
+  auto h = *make_frame(sd_header{.entries_length = 32}, raw{ent}, sd_options_length{.length = 0x10000});
+  CHECK_EQ(detail::be32(h.data() + 4), 32u);
+  CHECK_EQ(detail::be32(h.data() + 40), 0x10000u);
+  // field offsets for templates
+  static_assert(field_offset_v<wire::sd_header, "entries_length"> == 4);
+  static_assert(field_offset_v<wire::sd_options_length, "length"> == 0 && nm::wire_size_v<wire::sd_options_length> == 4);
+}
+
+TEST(sd_entry_and_option_builders) {
+  std::array<std::byte, 16> b{};
+  // eventgroup entry: counter, Initial Data Requested (legacy bit 7 of byte 13), reserved bits
+  CHECK((sd_eventgroup_entry{.type = sd_entry_type::subscribe_eventgroup, .service_id = 0x1234, .ttl = 5,
+                             .counter = 3, .eventgroup_id = 0x77, .initial_data_requested = true}
+             .write(b.data())));
+  sd_entry_view e(b.data());
+  CHECK(e.is_eventgroup() && e.counter() == 3 && e.eventgroup_id() == 0x77 && e.initial_data_requested());
+  CHECK_EQ(e.ttl(), 5u);
+  CHECK_EQ(e.instance_id(), 0xFFFF);
+  CHECK(!(sd_eventgroup_entry{.counter = 16}.write(b.data())));
+  CHECK(!(sd_eventgroup_entry{.reserved = 0x1000}.write(b.data())));
+  CHECK(!(sd_service_entry{.num_options_1 = 16}.write(b.data())));
+  CHECK(!(sd_service_entry{.ttl = 0x1000000}.write(b.data())));
+  CHECK(sd_service_entry::stop_offer_service(0x10, 1, 1, 0).write(b.data()));
+  CHECK(sd_entry_view(b.data()).is_stop() && sd_entry_view(b.data()).type() == sd_entry_type::offer_service);
+  CHECK(sd_eventgroup_entry::stop_subscribe(1, 2, 3, 4).write(b.data()));
+  CHECK(sd_entry_view(b.data()).is_stop() && sd_entry_view(b.data()).type() == sd_entry_type::subscribe_eventgroup);
+  CHECK(sd_eventgroup_entry::subscribe_nack(1, 2, 3, 4).write(b.data()));
+  CHECK(sd_entry_view(b.data()).is_stop() && sd_entry_view(b.data()).type() == sd_entry_type::subscribe_eventgroup_ack);
+  // options
+  std::array<std::byte, 24> o{};
+  CHECK(sd_ipv4_option{.type = sd_option_type::ipv4_multicast, .discardable = true, .address = ip4("239.1.2.3"),
+                       .port = 30502}
+            .write(o.data()));
+  sd_option_view ov(bytes(o.data(), 12));
+  CHECK(ov.length() == 9 && ov.type() == sd_option_type::ipv4_multicast && ov.discardable());
+  CHECK(ov.endpoint()->v4 == ip4("239.1.2.3") && ov.endpoint()->port == 30502 && ov.endpoint()->l4_proto == 17);
+  CHECK(sd_ipv6_option::multicast(ip6("ff02::1"), 30504).write(o.data()));
+  sd_option_view ov6(bytes(o.data(), 24));
+  CHECK(ov6.length() == 21 && ov6.endpoint()->is_v6 && ov6.endpoint()->v6 == ip6("ff02::1"));
+  CHECK(sd_load_balancing_option{.priority = 7, .weight = 9}.write(o.data()));
+  CHECK_EQ(sd_option_view(bytes(o.data(), 8)).load_balancing()->weight, 9);
+}
+
+TEST(ipdum_header_layers_all_layouts) {
+  const std::array<std::byte, 2> a{std::byte{0xaa}, std::byte{0xbb}};
+  const std::array<std::byte, 1> b{std::byte{0xcc}};
+  const std::array<pdu, 2> pdus{pdu{0x123456, a}, pdu{0x42, b}};
+  // known bytes for each layout
+  CHECK((*make_frame(ipdum_short_header{.id = 0x123456}, raw{a}) == hexbytes("12345602 aabb")));
+  CHECK((*make_frame(ipdum_short_header_le{.id = 0x123456}, raw{a}) == hexbytes("56341202 aabb")));
+  CHECK((*make_frame(ipdum_long_header{.id = 0x01020304}, raw{a}) == hexbytes("01020304 00000002 aabb")));
+  CHECK((*make_frame(ipdum_long_header_le{.id = 0x01020304}, raw{a}) == hexbytes("04030201 02000000 aabb")));
+  // the header layers stacked = the container builder, for every layout; and they parse back
+  for (auto hdr : {ipdum_header::short_header, ipdum_header::long_header})
+    for (auto order : {std::endian::big, std::endian::little}) {
+      const ipdum_config cfg{.header = hdr, .byte_order = order};
+      auto c = *make_frame(ipdum_container{.config = cfg, .pdus = pdus});
+      // dlc defaults to everything after the header: the last one derives it, the first is given
+      auto l = *make_frame(ipdum_pdu_header{cfg, 0x123456, 2}, raw{a}, ipdum_pdu_header{cfg, 0x42}, raw{b});
+      CHECK(c == l);
+      std::vector<u32> ids;
+      for (auto p : ipdum_pdus(l, cfg)) ids.push_back(p.id);
+      CHECK((ids == std::vector<u32>{0x123456, 0x42}));
+    }
+  // the typed layers in one stack: dlc covers what follows unless given
+  auto f = *make_frame(ipdum_long_header_le{.id = 7, .dlc = 2}, raw{a});
+  CHECK_EQ(detail::le32(f.data() + 4), 2u);
+  CHECK(!make_frame(ipdum_short_header{.id = 0x1000000}));
+  const std::array<std::byte, 256> big{};
+  CHECK(!make_frame(ipdum_short_header{.id = 1}, raw{big}));                    // DLC 256 does not fit
+  CHECK(make_frame(ipdum_short_header{.id = 1, .dlc = 0xFF}, raw{big}));        // explicit (malformed) DLC
+  CHECK(!make_frame(ipdum_pdu_header{.config = {}, .id = 1, .dlc = 0x100}));
+  // wire structs per layout, patchable by field name (templates)
+  static_assert(std::is_same_v<ipdum_hdr_t<ipdum_header::short_header, std::endian::little>, wire::ipdum_short_hdr_le>);
+  static_assert(std::is_same_v<ipdum_long_header_le::wire_type, wire::ipdum_long_hdr_le>);
+  static_assert(field_offset_v<wire::ipdum_short_hdr_le, "dlc"> == 3 && field_offset_v<wire::ipdum_long_hdr_le, "dlc"> == 4);
+  std::array<std::byte, 8> w{};
+  CHECK((patch<wire::ipdum_short_hdr_le, "id">(w.data(), 0xABCDEF)));
+  CHECK((patch<wire::ipdum_long_hdr_le, "dlc">(w.data(), 0x11223344)));
+  CHECK_EQ(u8(w[0]), 0xEF);
+  CHECK_EQ(detail::le32(w.data() + 4), 0x11223344u);
+  CHECK((field<wire::ipdum_short_hdr_le, "id">(w.data()) == 0xABCDEFu));
+  CHECK(!(patch<wire::ipdum_short_hdr_le, "id">(w.data(), 0x1000000)));
+}
+
+TEST(build_frame_layout_and_contexts) {
+  // offsets / sizes, per-layer contexts (after, next layer) and the checksum pass across a stack
+  std::array<std::byte, 256> buf{};
+  const std::array<std::byte, 7> pl{};
+  auto r = build_frame(buf, eth{}, vlan{.vid = 1}, vlan{.vid = 2}, ipv6{}, udp{}, someip{}, someip_tp{}, raw{pl});
+  CHECK(r.has_value());
+  const std::array<std::size_t, 8> off{0, 14, 18, 22, 62, 70, 86, 90};
+  for (std::size_t i = 0; i < 8; ++i) CHECK_EQ(r->layers[i].offset, off[i]);
+  CHECK_EQ(r->size, 97u);
+  auto pkt = packet::parse(bytes(buf.data(), r->size));
+  CHECK_EQ(pkt.vlan_count(), 2u);
+  CHECK(pkt.ipv6() && pkt.ipv6()->payload_length() == 8u + 16 + 4 + 7);
+  CHECK(pkt.udp() && pkt.udp()->length() == 8u + 16 + 4 + 7);
+  CHECK(l4_checksum_ok(bytes(buf.data() + 22, r->size - 22), ip_proto::udp, bytes(buf.data() + 62, r->size - 62)));
+  CHECK(pkt.someip() && pkt.someip()->is_tp());
+  // a failing layer reports its index; nothing else is claimed
+  auto bad = build_frame(buf, eth{}, ipv4{}, udp{}, someip{}, someip_tp{.offset = 3});
+  CHECK(!bad && bad.error().code == build_errc::invalid_field && bad.error().layer == 4);
+  // constant evaluation (nanom::emit at compile time)
+  static_assert([] {
+    std::array<std::byte, 64> b{};
+    auto x = build_frame(b, eth{}, ipv4{}, udp{.checksum = 0}, sd_options_length{}, ipdum_short_header_le{.id = 5});
+    return x && x->size == 14 + 20 + 8 + 4 + 4 && u8(b[14 + 20 + 8 + 3]) == 4 && u8(b[46]) == 5;
+  }());
+}
+
 TEST_MAIN()

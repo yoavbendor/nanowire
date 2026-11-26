@@ -31,13 +31,13 @@ Its only dependency is nanom (header-only, fetched by CMake). Apache-2.0.
 | Layer | Read (zero-copy view) | Build |
 |---|---|---|
 | Ethernet II, 802.1Q / 802.1ad (QinQ) | `ethernet_view`, `vlan_view` | `eth`, `vlan` |
-| IPv4 + options | `ipv4_view`, `ipv4_options` | `ipv4` (ihl / total_length / checksum derived) |
+| IPv4 + options | `ipv4_view`, `ipv4_options` | `ipv4` (ihl / total_length / checksum derived; `.reserved` = the "evil" flag bit) |
 | IPv6 + extension chain (HbH, Routing / SRv6, Fragment, DstOpts, AH) | `ipv6_view`, `ipv6_ext_range`, `ipv6_fragment_view`, `ipv6_routing_view` | `ipv6`, `ipv6_hbh`, `ipv6_srh`, `ipv6_frag`, `ipv6_dstopts` |
 | UDP, TCP (header) | `udp_view`, `tcp_view` | `udp`, `tcp` (pseudo-header checksums, SRv6-aware) |
-| SOME/IP, SOME/IP-TP | `someip_view`, `someip_tp_view`, `someip_messages` | `someip{.tp = ...}` |
-| SOME/IP-SD entries + all option types | `sd_view`, `sd_entries`, `sd_options`, `sd_config_items` | `someip_sd`, `sd_entry`, `sd_option` |
+| SOME/IP, SOME/IP-TP | `someip_view`, `someip_tp_view`, `someip_messages` | `someip{.tp = ...}`, or `someip` + `someip_tp` layers |
+| SOME/IP-SD entries + all option types | `sd_view`, `sd_entries`, `sd_options`, `sd_config_items` | `someip_sd` (whole payload); fixed-size `sd_header`, `sd_service_entry`, `sd_eventgroup_entry`, `sd_options_length`, `sd_ipv4_option`, `sd_ipv6_option`, `sd_load_balancing_option`; runtime-typed `sd_entry`, `sd_option` |
 | AUTOSAR PDU-over-IP (SoAd header) | `soad_pdus` | `soad_pdu`, `soad_pdu_header` |
-| AUTOSAR IpduM container PDUs (short / long header, BE / LE) | `ipdum_pdus` | `ipdum_container` |
+| AUTOSAR IpduM container PDUs (short / long header, BE / LE) | `ipdum_pdus` | `ipdum_container`; one header as a layer: `ipdum_short_header`, `ipdum_long_header` (+ `_le`), `ipdum_pdu_header` (config at run time) |
 
 Plus: the one-pass `packet` view, zero-copy `reassembler` (IPv4, IPv6, SOME/IP-TP), and a
 runtime `registry` with a compile-time fast path.
@@ -140,6 +140,41 @@ the frame is written. Any explicit value (`.total_length`, `.checksum`, `.length
 derivation, so malformed frames can be crafted on purpose. SD:
 `someip_sd_header(session)` + `someip_sd{.entries = ..., .options = ...}`.
 
+Every header also exists as a **fixed-size layer backed by exactly one wire struct**, which is what
+a crafting template needs (each layer's patch points are its wire struct's fields):
+
+```cpp
+// SOME/IP-TP: the TP header as its own layer (the SOME/IP header ORs in the TP flag)
+make_frame(eth{}, ipv4{}, udp{}, someip{.service_id = 0x1234, .method_id = 0x8003},
+           someip_tp{.offset = 1392, .more = true}, raw{segment});
+// SOME/IP-SD from fixed blocks: entries_length = the entry layers right after sd_header,
+// options_length = everything after sd_options_length
+make_frame(eth{}, ipv4{}, udp{.src_port = 30490, .dst_port = 30490}, someip_sd_header(7),
+           sd_header{},
+           sd_service_entry::offer_service(0x1234, 1, 1, 0).with_options(0, 1),     // wire::sd_service_entry
+           sd_eventgroup_entry::subscribe(0x1234, 1, 1, 0x10),                      // wire::sd_eventgroup_entry
+           sd_options_length{},                                                     // wire::sd_options_length
+           sd_ipv4_option::endpoint(ip4("10.0.0.1"), ip_proto::udp, 30501));        // wire::sd_ipv4_option
+// One IpduM contained PDU: short [id:24][dlc:8] / long [id:32][dlc:32] header, big- or
+// little-endian (wire::ipdum_short_hdr / _le, wire::ipdum_long_hdr / _le); dlc = bytes after it
+make_frame(soad_pdu_header{.id = 0x300}, ipdum_short_header_le{.id = 0x42}, raw{pdu_data});
+```
+
+| layer | wire struct |
+|---|---|
+| `eth`, `vlan` | `wire::eth_hdr`, `wire::vlan_tag` |
+| `ipv4` (no options), `ipv6`, `ipv6_frag` | `wire::ipv4_hdr`, `wire::ipv6_hdr`, `wire::ipv6_frag_hdr` |
+| `udp`, `tcp` (no options) | `wire::udp_hdr`, `wire::tcp_hdr` |
+| `someip` (without `.tp`), `someip_tp` | `wire::someip_hdr`, `wire::someip_tp_hdr` |
+| `sd_header`, `sd_options_length` | `wire::sd_header`, `wire::sd_options_length` |
+| `sd_service_entry`, `sd_eventgroup_entry` | `wire::sd_service_entry`, `wire::sd_eventgroup_entry` |
+| `sd_ipv4_option`, `sd_ipv6_option`, `sd_load_balancing_option` | `wire::sd_ipv4_option`, `wire::sd_ipv6_option`, `wire::sd_load_balancing_option` |
+| `soad_pdu_header` | `wire::soad_pdu_hdr` |
+| `ipdum_short_header` / `_le`, `ipdum_long_header` / `_le` | `ipdum_hdr_t<header, byte order>`: `wire::ipdum_short_hdr` / `_le`, `wire::ipdum_long_hdr` / `_le` |
+
+`sd_entry` / `sd_option` (kind chosen by `.type` at run time) and `ipdum_pdu_header` (layout from an
+`ipdum_config`) remain as conveniences; they are written through the typed builders above.
+
 ### Dispatch
 
 ```cpp
@@ -182,12 +217,39 @@ python3 bench/gen_capture.py auto.pcap 1000000
 valgrind --tool=callgrind ./build/bench/packet_walk_bench small.pcap 1 nanowire
 ```
 
+### Building frames
+
+`bench/build_frame_bench` writes Eth / VLAN / IPv4 / UDP / SOME/IP + 32 B payload (94 B) per frame,
+IPv4 id and SOME/IP session changing per frame, every header value read from memory (GCC 13 / Clang
+18 -O3, shared 4-core VM):
+
+| mode | instr/frame (callgrind) GCC / Clang | ns/frame (GCC) |
+|---|---|---|
+| `build_frame` (builders: lengths, types, IPv4 checksum derived; every field range-checked) | 518 / 555 | ~43 |
+| the same bytes as one `nanom::emit` per wire struct, written by hand | 343 / 331 | ~35 |
+| prebuilt frame copied + 2 fields patched + IPv4 checksum (the template floor) | 82 | ~19 |
+
+`build_frame` is one pass for the offsets, one write pass with a per-layer context assembled on
+the fly (offsets kept in locals, so byte stores into the frame cannot force reloads) and a
+finalize pass only over layers that have one. The rest of its cost over hand-written
+`nanom::emit` is the builders themselves: range checks of every field, the optional overrides,
+the derived type / protocol / length fields. Repeated frames of one shape belong in a compiled
+template (nanocraft), which costs what the floor row does.
+
+```sh
+./build/bench/build_frame_bench all
+valgrind --tool=callgrind --toggle-collect='*frame_once*' ./build/bench/build_frame_bench build_frame 100000 1
+```
+
 ## Tests
 
 `ctest` runs:
 
 - `test_protocols` — parse / build round trips of every protocol, known-answer bytes (IPv4
-  checksum, IpduM / PDU layouts), field offsets and in-place patching with RFC 1624 update.
+  checksum, IpduM / PDU layouts in both byte orders), field offsets and in-place patching with
+  RFC 1624 update, every fixed-size layer against the variable-size builder it replaces (SD
+  blocks vs `someip_sd`, IpduM headers vs `ipdum_container`, `someip_tp` vs `someip{.tp}`), and
+  `build_frame` in constant evaluation.
 - `test_malformed` — every truncation of every corpus frame and 60 k random mutations, each from
   an exactly-sized heap buffer (ASan trips on a one-byte over-read), plus a check that every span
   a reader returns lies inside its input.
@@ -199,8 +261,10 @@ valgrind --tool=callgrind ./build/bench/packet_walk_bench small.pcap 1 nanowire
   generated capture (incl. byte-identical reassembled datagrams).
 - `oracle_*` — scapy as an independent oracle: nanowire's reading of scapy-built packets equals
   scapy's dissection, and scapy's dissection of nanowire-built frames equals what nanowire meant,
-  with every length / checksum re-derived by scapy. Committed vectors always run; live scapy runs
-  when a Python with scapy is found.
+  with every length / checksum re-derived by scapy (incl. SD messages built from the fixed-size
+  layers, a stand-alone `someip_tp` layer and the IPv4 reserved bit). Committed vectors always
+  run; live scapy runs when a Python with scapy is found. scapy has no IpduM dissector: IpduM is
+  covered by known-answer bytes in `test_protocols`.
 
 CI (`.github/workflows/ci.yml`): GCC 13 and Clang 18, Release and ASan+UBSan, `-Werror`.
 
@@ -210,7 +274,7 @@ CI (`.github/workflows/ci.yml`): GCC 13 and Clang 18, Release and ASan+UBSan, `-
 include/nanowire/   core, ethernet, ip, transport, someip, someip_sd, autosar_pdu,
                     packet, build, reassembly, dispatch, nanowire (umbrella), detail/checksum
 tests/              ctest suites, oracle/scapy_oracle.py, data/ (committed scapy vectors)
-bench/              packet_walk_bench, gen_capture.py
+bench/              packet_walk_bench, build_frame_bench, gen_capture.py
 ```
 
 ## License

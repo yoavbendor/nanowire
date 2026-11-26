@@ -176,6 +176,8 @@ class ipv4_view {
   constexpr u8 ecn() const noexcept { return field<wire::ipv4_hdr, "ecn">(p_); }
   constexpr u16 total_length() const noexcept { return field<wire::ipv4_hdr, "total_length">(p_); }
   constexpr u16 identification() const noexcept { return field<wire::ipv4_hdr, "identification">(p_); }
+  /// The reserved flag bit (bit 0 of the flags; RFC 3514's "evil bit"). Must be zero on the wire.
+  constexpr bool reserved() const noexcept { return field<wire::ipv4_hdr, "reserved">(p_) != 0; }
   constexpr bool df() const noexcept { return field<wire::ipv4_hdr, "df">(p_) != 0; }
   constexpr bool mf() const noexcept { return field<wire::ipv4_hdr, "mf">(p_) != 0; }
   /// Fragment offset in 8-byte units (frag_offset_bytes() for bytes).
@@ -464,6 +466,7 @@ struct ipv4 {
   u8 dscp = 0;
   u8 ecn = 0;
   u16 id = 0;
+  bool reserved = false;  // the reserved flag bit (RFC 3514 "evil bit"); set only to craft it
   bool df = false;
   bool mf = false;
   u16 frag_offset = 0;  // 8-byte units
@@ -485,6 +488,7 @@ struct ipv4 {
     h.dscp = dscp;
     h.ecn = ecn;
     h.identification = id;
+    h.reserved = u8(reserved);
     h.df = u8(df);
     h.mf = u8(mf);
     h.frag_offset = frag_offset;

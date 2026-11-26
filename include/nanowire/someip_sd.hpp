@@ -3,11 +3,21 @@
 // header, entries (service / eventgroup) and options (configuration, load balancing, IPv4 / IPv6
 // endpoint, multicast and SD-endpoint).
 //
-//   wire::sd_header / sd_service_entry / sd_eventgroup_entry / sd_option_hdr /
-//   sd_ipv4_option / sd_ipv6_option / sd_load_balancing_option        layouts
+//   wire::sd_header / sd_service_entry / sd_eventgroup_entry / sd_options_length /
+//   sd_option_hdr / sd_ipv4_option / sd_ipv6_option / sd_load_balancing_option   layouts
 //   sd_view, sd_entry_view, sd_option_view, sd_entries, sd_options,
 //   sd_config_items                                                    zero-copy readers / ranges
-//   sd_entry, sd_option, someip_sd (+ someip_sd_header())               builders
+//   someip_sd (+ someip_sd_header())                                   builder: a whole SD payload
+//   sd_header, sd_service_entry, sd_eventgroup_entry, sd_options_length,
+//   sd_ipv4_option, sd_ipv6_option, sd_load_balancing_option           fixed-size builders, one per
+//                                                                      wire struct (frame templates)
+//   sd_entry, sd_option                                                runtime-typed conveniences
+//
+// The fixed-size layers stack like any others:
+//   someip_sd_header(7), sd_header{}, sd_service_entry::offer_service(0x1234, 1, 1, 0).with_options(0, 1),
+//   sd_options_length{}, sd_ipv4_option::endpoint(ip4("10.0.0.1"), ip_proto::udp, 30501)
+// sd_header's entries_length covers the entry layers right after it; sd_options_length covers
+// everything after it.
 //
 // An SD message is a SOME/IP message with Message ID 0xFFFF8100; its payload is
 //   [flags:8][reserved:24][entries_length:32][entries: n * 16][options_length:32][options]
@@ -42,6 +52,9 @@ struct sd_eventgroup_entry {
   nm::ubits<4> counter;
   nm::be<u16> eventgroup_id;
 };
+struct sd_options_length {  // the word between the entries array and the options array
+  nm::be<u32> length;
+};
 struct sd_option_hdr {
   nm::be<u16> length;  // bytes after the type octet (the reserved octet included)
   u8 type;
@@ -73,6 +86,7 @@ NANOM_DESCRIBE(nanowire::wire::sd_service_entry, type, index_1, index_2, num_opt
                instance_id, major_version, ttl, minor_version);
 NANOM_DESCRIBE(nanowire::wire::sd_eventgroup_entry, type, index_1, index_2, num_options_1, num_options_2, service_id,
                instance_id, major_version, ttl, reserved, counter, eventgroup_id);
+NANOM_DESCRIBE(nanowire::wire::sd_options_length, length);
 NANOM_DESCRIBE(nanowire::wire::sd_option_hdr, length, type, reserved);
 NANOM_DESCRIBE(nanowire::wire::sd_ipv4_option, length, type, reserved, address, reserved2, l4_proto, port);
 NANOM_DESCRIBE(nanowire::wire::sd_ipv6_option, length, type, reserved, address, reserved2, l4_proto, port);
@@ -82,7 +96,8 @@ namespace nanowire {
 
 static_assert(nm::wire_size_v<wire::sd_header> == 8 && nm::wire_size_v<wire::sd_service_entry> == 16 &&
               nm::wire_size_v<wire::sd_eventgroup_entry> == 16 && nm::wire_size_v<wire::sd_ipv4_option> == 12 &&
-              nm::wire_size_v<wire::sd_ipv6_option> == 24 && nm::wire_size_v<wire::sd_load_balancing_option> == 8);
+              nm::wire_size_v<wire::sd_ipv6_option> == 24 && nm::wire_size_v<wire::sd_load_balancing_option> == 8 &&
+              nm::wire_size_v<wire::sd_options_length> == 4);
 
 namespace sd_flag {
 inline constexpr u8 reboot = 0x80, unicast = 0x40, explicit_initial_data_control = 0x20;
@@ -362,8 +377,105 @@ class sd_view {
 // builders
 // ---------------------------------------------------------------------------------------------
 
-/// One SD entry. Service types (0, 1) write minor_version; eventgroup types (6, 7) write
-/// counter + eventgroup_id. Use the factories for the common forms.
+/// The 8-byte SD header [flags:8][reserved:24][entries_length:32]. entries_length is derived: the
+/// bytes of the entry layers (sd_service_entry / sd_eventgroup_entry / sd_entry) right after it in
+/// the frame; set `entries_length` to override (entries carried as raw bytes, malformed lengths).
+struct sd_header {
+  u8 flags = sd_flag::reboot | sd_flag::unicast;
+  std::optional<u32> entries_length{};
+  std::array<u8, 3> reserved{};
+
+  static constexpr std::size_t size() noexcept { return 8; }
+  constexpr bool write(std::byte* p, const build_ctx& c = {}) const noexcept {
+    const std::size_t el = entries_length ? *entries_length : c.sd_entries_after;
+    if (el > 0xFFFFFFFFu) return false;
+    return emit_wire(wire::sd_header{flags, reserved, u32(el)}, p) == 8;
+  }
+};
+
+/// A service entry (FindService 0x00, OfferService / StopOffer 0x01), wire::sd_service_entry.
+struct sd_service_entry {
+  u8 type = sd_entry_type::offer_service;
+  u8 index_1 = 0, index_2 = 0, num_options_1 = 0, num_options_2 = 0;
+  u16 service_id = 0;
+  u16 instance_id = 0xFFFF;
+  u8 major_version = 0xFF;
+  u32 ttl = 0xFFFFFF;  // 24 bits; 0 = StopOffer
+  u32 minor_version = 0xFFFFFFFF;
+
+  static constexpr bool sd_entry_layer = true;
+  static constexpr sd_service_entry find_service(u16 svc, u16 inst = 0xFFFF, u8 major = 0xFF,
+                                                 u32 minor = 0xFFFFFFFF, u32 ttl = 0xFFFFFF) noexcept {
+    return {sd_entry_type::find_service, 0, 0, 0, 0, svc, inst, major, ttl, minor};
+  }
+  static constexpr sd_service_entry offer_service(u16 svc, u16 inst, u8 major, u32 minor, u32 ttl = 0xFFFFFF) noexcept {
+    return {sd_entry_type::offer_service, 0, 0, 0, 0, svc, inst, major, ttl, minor};
+  }
+  static constexpr sd_service_entry stop_offer_service(u16 svc, u16 inst, u8 major, u32 minor) noexcept {
+    return offer_service(svc, inst, major, minor, 0);
+  }
+  /// Reference options [first, first+count) as run 1 (and optionally a second run).
+  constexpr sd_service_entry& with_options(u8 first, u8 count, u8 first2 = 0, u8 count2 = 0) noexcept {
+    index_1 = first, num_options_1 = count, index_2 = first2, num_options_2 = count2;
+    return *this;
+  }
+  static constexpr std::size_t size() noexcept { return 16; }
+  constexpr bool write(std::byte* p, const build_ctx& = {}) const noexcept {
+    if (num_options_1 > 15 || num_options_2 > 15 || ttl > 0xFFFFFF) return false;
+    return emit_wire(wire::sd_service_entry{type, index_1, index_2, {num_options_1}, {num_options_2}, service_id,
+                                            instance_id, major_version, {ttl}, minor_version},
+                     p) == 16;
+  }
+};
+
+/// An eventgroup entry (SubscribeEventgroup 0x06, SubscribeEventgroupAck 0x07; TTL 0 = Stop /
+/// Nack), wire::sd_eventgroup_entry.
+struct sd_eventgroup_entry {
+  u8 type = sd_entry_type::subscribe_eventgroup;
+  u8 index_1 = 0, index_2 = 0, num_options_1 = 0, num_options_2 = 0;
+  u16 service_id = 0;
+  u16 instance_id = 0xFFFF;
+  u8 major_version = 0xFF;
+  u32 ttl = 0xFFFFFF;  // 24 bits
+  u8 counter = 0;      // 4 bits
+  u16 eventgroup_id = 0;
+  bool initial_data_requested = false;  // legacy flag: bit 7 of byte 13 (reserved bit 0x008)
+  u16 reserved = 0;                     // the 12 reserved bits as on the wire (OR-ed with the flag)
+
+  static constexpr bool sd_entry_layer = true;
+  static constexpr sd_eventgroup_entry subscribe(u16 svc, u16 inst, u8 major, u16 eventgroup, u32 ttl = 0xFFFFFF,
+                                                 u8 counter = 0) noexcept {
+    return {sd_entry_type::subscribe_eventgroup, 0, 0, 0, 0, svc, inst, major, ttl, counter, eventgroup, false, 0};
+  }
+  static constexpr sd_eventgroup_entry stop_subscribe(u16 svc, u16 inst, u8 major, u16 eventgroup,
+                                                      u8 counter = 0) noexcept {
+    return subscribe(svc, inst, major, eventgroup, 0, counter);
+  }
+  static constexpr sd_eventgroup_entry subscribe_ack(u16 svc, u16 inst, u8 major, u16 eventgroup,
+                                                     u32 ttl = 0xFFFFFF, u8 counter = 0) noexcept {
+    return {sd_entry_type::subscribe_eventgroup_ack, 0, 0, 0, 0, svc, inst, major, ttl, counter, eventgroup, false, 0};
+  }
+  static constexpr sd_eventgroup_entry subscribe_nack(u16 svc, u16 inst, u8 major, u16 eventgroup,
+                                                      u8 counter = 0) noexcept {
+    return subscribe_ack(svc, inst, major, eventgroup, 0, counter);
+  }
+  constexpr sd_eventgroup_entry& with_options(u8 first, u8 count, u8 first2 = 0, u8 count2 = 0) noexcept {
+    index_1 = first, num_options_1 = count, index_2 = first2, num_options_2 = count2;
+    return *this;
+  }
+  static constexpr std::size_t size() noexcept { return 16; }
+  constexpr bool write(std::byte* p, const build_ctx& = {}) const noexcept {
+    if (num_options_1 > 15 || num_options_2 > 15 || ttl > 0xFFFFFF || counter > 15 || reserved > 0xFFF) return false;
+    const u16 res = u16(reserved | (initial_data_requested ? 0x008 : 0));
+    return emit_wire(wire::sd_eventgroup_entry{type, index_1, index_2, {num_options_1}, {num_options_2}, service_id,
+                                               instance_id, major_version, {ttl}, {res}, {counter}, eventgroup_id},
+                     p) == 16;
+  }
+};
+
+/// One SD entry whose kind is chosen at run time by `type`: eventgroup types (6, 7) are written as
+/// an sd_eventgroup_entry, every other type as an sd_service_entry. A convenience for entry
+/// arrays (someip_sd{.entries = ...}); for frame templates use the two typed builders.
 struct sd_entry {
   u8 type = sd_entry_type::offer_service;
   u8 index_1 = 0, index_2 = 0, num_options_1 = 0, num_options_2 = 0;
@@ -375,6 +487,7 @@ struct sd_entry {
   u8 counter = 0;
   u16 eventgroup_id = 0;
 
+  static constexpr bool sd_entry_layer = true;
   static constexpr sd_entry find_service(u16 svc, u16 inst = 0xFFFF, u8 major = 0xFF, u32 minor = 0xFFFFFFFF,
                                          u32 ttl = 0xFFFFFF) noexcept {
     return {sd_entry_type::find_service, 0, 0, 0, 0, svc, inst, major, ttl, minor, 0, 0};
@@ -396,21 +509,104 @@ struct sd_entry {
     return *this;
   }
 
-  constexpr bool write(std::byte* p) const noexcept {
-    if (num_options_1 > 15 || num_options_2 > 15 || ttl > 0xFFFFFF || counter > 15) return false;
-    if (type == sd_entry_type::subscribe_eventgroup || type == sd_entry_type::subscribe_eventgroup_ack) {
-      wire::sd_eventgroup_entry w{type, index_1, index_2, {num_options_1}, {num_options_2}, service_id, instance_id,
-                                  major_version, {ttl}, {0}, {counter}, eventgroup_id};
-      return emit_wire(w, p) == 16;
-    }
-    wire::sd_service_entry w{type,          index_1,       index_2, {num_options_1}, {num_options_2}, service_id,
-                             instance_id,   major_version, {ttl},   minor_version};
-    return emit_wire(w, p) == 16;
+  constexpr bool is_eventgroup() const noexcept {
+    return type == sd_entry_type::subscribe_eventgroup || type == sd_entry_type::subscribe_eventgroup_ack;
+  }
+  /// The typed builders this entry is written as.
+  constexpr sd_service_entry as_service() const noexcept {
+    return {type, index_1, index_2, num_options_1, num_options_2, service_id, instance_id, major_version, ttl,
+            minor_version};
+  }
+  constexpr sd_eventgroup_entry as_eventgroup() const noexcept {
+    return {type, index_1, index_2, num_options_1, num_options_2, service_id, instance_id, major_version, ttl,
+            counter, eventgroup_id, false, 0};
+  }
+
+  static constexpr std::size_t size() noexcept { return 16; }
+  constexpr bool write(std::byte* p, const build_ctx& c = {}) const noexcept {
+    if (counter > 15) return false;
+    return is_eventgroup() ? as_eventgroup().write(p, c) : as_service().write(p, c);
   }
 };
 
-/// One SD option. Use the factories; `config` is the raw configuration string (items as
-/// [len][chars]..., terminated by a 0 byte — see sd_encode_config).
+/// The options-array length word; `length` defaults to every byte after it in the frame (the
+/// option layers that follow).
+struct sd_options_length {
+  std::optional<u32> length{};
+  static constexpr std::size_t size() noexcept { return 4; }
+  constexpr bool write(std::byte* p, const build_ctx& c = {}) const noexcept {
+    if (!length && c.after > 0xFFFFFFFFu) return false;
+    return emit_wire(wire::sd_options_length{length ? *length : u32(c.after)}, p) == 4;
+  }
+};
+
+/// An IPv4 endpoint (0x04), multicast (0x14) or SD-endpoint (0x24) option, wire::sd_ipv4_option
+/// (length 9).
+struct sd_ipv4_option {
+  u8 type = sd_option_type::ipv4_endpoint;
+  bool discardable = false;
+  ipv4_addr address{};
+  u8 l4_proto = ip_proto::udp;
+  u16 port = 0;
+
+  static constexpr sd_ipv4_option endpoint(ipv4_addr a, u8 proto, u16 port) noexcept {
+    return {sd_option_type::ipv4_endpoint, false, a, proto, port};
+  }
+  static constexpr sd_ipv4_option multicast(ipv4_addr a, u16 port) noexcept {
+    return {sd_option_type::ipv4_multicast, false, a, ip_proto::udp, port};
+  }
+  static constexpr sd_ipv4_option sd_endpoint(ipv4_addr a, u16 port = nanowire::port::someip_sd) noexcept {
+    return {sd_option_type::ipv4_sd_endpoint, false, a, ip_proto::udp, port};
+  }
+  static constexpr std::size_t size() noexcept { return 12; }
+  constexpr bool write(std::byte* p, const build_ctx& = {}) const noexcept {
+    return emit_wire(wire::sd_ipv4_option{9, type, u8(discardable ? 0x80 : 0), address, 0, l4_proto, port}, p) == 12;
+  }
+};
+
+/// An IPv6 endpoint (0x06), multicast (0x16) or SD-endpoint (0x26) option, wire::sd_ipv6_option
+/// (length 21).
+struct sd_ipv6_option {
+  u8 type = sd_option_type::ipv6_endpoint;
+  bool discardable = false;
+  ipv6_addr address{};
+  u8 l4_proto = ip_proto::udp;
+  u16 port = 0;
+
+  static constexpr sd_ipv6_option endpoint(ipv6_addr a, u8 proto, u16 port) noexcept {
+    return {sd_option_type::ipv6_endpoint, false, a, proto, port};
+  }
+  static constexpr sd_ipv6_option multicast(ipv6_addr a, u16 port) noexcept {
+    return {sd_option_type::ipv6_multicast, false, a, ip_proto::udp, port};
+  }
+  static constexpr sd_ipv6_option sd_endpoint(ipv6_addr a, u16 port = nanowire::port::someip_sd) noexcept {
+    return {sd_option_type::ipv6_sd_endpoint, false, a, ip_proto::udp, port};
+  }
+  static constexpr std::size_t size() noexcept { return 24; }
+  constexpr bool write(std::byte* p, const build_ctx& = {}) const noexcept {
+    return emit_wire(wire::sd_ipv6_option{21, type, u8(discardable ? 0x80 : 0), address, 0, l4_proto, port}, p) == 24;
+  }
+};
+
+/// A load-balancing option (0x02), wire::sd_load_balancing_option (length 5).
+struct sd_load_balancing_option {
+  u16 priority = 0;
+  u16 weight = 0;
+  bool discardable = false;
+  static constexpr std::size_t size() noexcept { return 8; }
+  constexpr bool write(std::byte* p, const build_ctx& = {}) const noexcept {
+    return emit_wire(wire::sd_load_balancing_option{5, sd_option_type::load_balancing, u8(discardable ? 0x80 : 0),
+                                                    priority, weight},
+                     p) == 8;
+  }
+};
+
+/// One SD option whose kind is chosen at run time by `type` (IPv4 / IPv6 endpoint-like options
+/// are written as sd_ipv4_option / sd_ipv6_option, load balancing as sd_load_balancing_option,
+/// configuration and unknown types as [length][type][reserved][config bytes]). Use the factories;
+/// `config` is the raw configuration string (items as [len][chars]..., terminated by a 0 byte —
+/// see sd_encode_config). A convenience for option arrays; for frame templates use the typed
+/// builders.
 struct sd_option {
   u8 type = sd_option_type::ipv4_endpoint;
   bool discardable = false;
@@ -448,21 +644,25 @@ struct sd_option {
 
   constexpr bool is_v4() const noexcept { return type == 0x04 || type == 0x14 || type == 0x24; }
   constexpr bool is_v6() const noexcept { return type == 0x06 || type == 0x16 || type == 0x26; }
+  /// The typed builders this option is written as (when is_v4() / is_v6() / load balancing).
+  constexpr sd_ipv4_option as_ipv4() const noexcept { return {type, discardable, v4, l4_proto, port}; }
+  constexpr sd_ipv6_option as_ipv6() const noexcept { return {type, discardable, v6, l4_proto, port}; }
+  constexpr sd_load_balancing_option as_load_balancing() const noexcept { return {priority, weight, discardable}; }
+
   constexpr std::size_t size() const noexcept {
     if (is_v4()) return 12;
     if (is_v6()) return 24;
     if (type == sd_option_type::load_balancing) return 8;
     return 4 + config.size();  // configuration / unknown: raw body
   }
-  constexpr bool write(std::byte* p) const noexcept {
-    const u8 res = discardable ? 0x80 : 0x00;
-    if (is_v4()) return emit_wire(wire::sd_ipv4_option{9, type, res, v4, 0, l4_proto, port}, p) == 12;
-    if (is_v6()) return emit_wire(wire::sd_ipv6_option{21, type, res, v6, 0, l4_proto, port}, p) == 24;
-    if (type == sd_option_type::load_balancing)
-      return emit_wire(wire::sd_load_balancing_option{5, type, res, priority, weight}, p) == 8;
+  constexpr bool write(std::byte* p, const build_ctx& c = {}) const noexcept {
+    if (is_v4()) return as_ipv4().write(p, c);
+    if (is_v6()) return as_ipv6().write(p, c);
+    if (type == sd_option_type::load_balancing) return as_load_balancing().write(p, c);
     if (config.size() + 1 > 0xffff) return false;
-    if (emit_wire(wire::sd_option_hdr{u16(1 + config.size()), type, res}, p) != 4) return false;
-    for (std::size_t i = 0; i < config.size(); ++i) p[4 + i] = config[i];
+    if (emit_wire(wire::sd_option_hdr{u16(1 + config.size()), type, u8(discardable ? 0x80 : 0x00)}, p) != 4)
+      return false;
+    detail::copy_bytes(p + 4, config);
     return true;
   }
 };
@@ -504,7 +704,7 @@ struct someip_sd {
       if (!e.write(q)) return false;
       q += 16;
     }
-    detail::put_be32(q, u32(ol));
+    if (emit_wire(wire::sd_options_length{u32(ol)}, q) != 4) return false;
     q += 4;
     for (const auto& o : options) {
       if (!o.write(q)) return false;

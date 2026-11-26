@@ -104,6 +104,14 @@ constexpr void put_le32(std::byte* p, u32 v) noexcept {
   p[2] = std::byte(v >> 16);
   p[3] = std::byte(v >> 24);
 }
+/// Copy `src` to `dst` (non-overlapping): memcpy at run time, a byte loop in constant evaluation.
+[[gnu::always_inline]] constexpr void copy_bytes(std::byte* dst, bytes src) noexcept {
+  if consteval {
+    for (std::size_t i = 0; i < src.size(); ++i) dst[i] = src[i];
+  } else {
+    if (!src.empty()) std::memcpy(dst, src.data(), src.size());
+  }
+}
 template <std::size_t N>
 constexpr std::array<u8, N> load_array(const std::byte* p) noexcept {
   std::array<u8, N> a{};
@@ -296,11 +304,18 @@ inline constexpr u16 someip_sd = 30490;
 /// follow this layer's own bytes up to the end of the frame (the "payload" for length fields).
 /// `next_ethertype` / `next_ip_proto` describe the following layer (0 when it has none), so an
 /// eth / vlan / ipv4 builder left at its default derives its type / protocol field.
+/// A default-constructed build_ctx (after = 0, nothing next) is valid for every builder.
 struct build_ctx {
   std::size_t after = 0;
   u16 next_ethertype = 0;
   u8 next_ip_proto = 0;
   bool has_next_ip_proto = false;
+  // Message Type bits the next layer asks the SOME/IP header before it to set (someip_tp: the TP
+  // flag 0x20), so someip{} / someip_tp{} stacked as two layers form a TP segment.
+  u8 next_someip_type_flags = 0;
+  // Bytes of the SOME/IP-SD entry layers (static `sd_entry_layer`) right after this layer: what an
+  // sd_header{} derives its entries_length from.
+  std::size_t sd_entries_after = 0;
   // enclosing L3 (for UDP / TCP pseudo-header checksums), as offsets into the frame
   std::byte* frame = nullptr;
   std::size_t l3_off = 0;
