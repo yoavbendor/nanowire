@@ -49,6 +49,12 @@ class packet {
       et = detail::be16(p + 12);
       off = 14;
       while (is_vlan_tpid(et)) {
+        if (k.vlans_ == 64) {
+          k.ethertype_ = et;
+          k.l3_off_ = off;
+          k.flags_ |= malformed;
+          return k;
+        }
         if (n - off < 4) {
           k.ethertype_ = et;
           k.l3_off_ = off;
@@ -113,7 +119,7 @@ class packet {
         }
         u32 len;
         if (proto == ip_proto::ipv6_frag) {
-          k.frag6_off_ = u16(l4 - off);
+          k.frag6_off_ = l4 - off;
           k.flags_ |= fragment;
           len = 8;
           if (detail::be16(p + l4 + 2) & 0xfff8) {  // non-first fragment: data, not headers
@@ -136,6 +142,13 @@ class packet {
         }
         proto = u8(p[l4]);
         l4 += len;
+      }
+      if (is_ipv6_extension(proto)) {
+        k.l3_end_ = l3_end;
+        k.proto_ = proto;
+        k.l4_off_ = l4;
+        k.flags_ |= malformed;
+        return k;
       }
     } else {
       if (et != 0) k.l3_ = l3_kind::other;
@@ -248,8 +261,8 @@ class packet {
   static constexpr u8 has_eth = 1, fragment = 2, malformed = 4;
   const std::byte* p_ = nullptr;
   u32 n_ = 0;
-  u32 l3_off_ = 0, l3_end_ = 0, l4_off_ = 0, pay_off_ = 0, pay_end_ = 0;
-  u16 ethertype_ = 0, frag6_off_ = 0;
+  u32 l3_off_ = 0, l3_end_ = 0, l4_off_ = 0, pay_off_ = 0, pay_end_ = 0, frag6_off_ = 0;
+  u16 ethertype_ = 0;
   l3_kind l3_ = l3_kind::none;
   l4_kind l4_ = l4_kind::none;
   u8 proto_ = 0, vlans_ = 0, flags_ = 0;

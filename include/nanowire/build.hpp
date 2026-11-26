@@ -75,13 +75,20 @@ struct build_error {
   std::size_t layer;  // index of the failing layer (N for buffer_too_small)
 };
 
-/// Total bytes the layers occupy.
-template <layer... L>
-constexpr std::size_t frame_size(const L&... ls) noexcept {
-  return (std::size_t{0} + ... + std::size_t(ls.size()));
-}
-
 namespace detail {
+template <layer... L>
+constexpr std::optional<std::size_t> checked_frame_size(const L&... ls) noexcept {
+  std::size_t total = 0;
+  bool ok = true;
+  (
+      [&](std::size_t s) {
+        if (s > std::size_t(-1) - total) ok = false;
+        else total += s;
+      }(std::size_t(ls.size())),
+      ...);
+  if (!ok) return std::nullopt;
+  return total;
+}
 template <class L>
 constexpr void announce(const L& l, build_ctx& c) noexcept {
   if constexpr (requires { l.ethertype(); }) c.next_ethertype = u16(l.ethertype());
@@ -101,6 +108,12 @@ constexpr u8 l3_version_of(const L& l) noexcept {
 }
 }  // namespace detail
 
+/// Total bytes the layers occupy (saturates at SIZE_MAX on overflow).
+template <layer... L>
+constexpr std::size_t frame_size(const L&... ls) noexcept {
+  return detail::checked_frame_size(ls...).value_or(std::size_t(-1));
+}
+
 /// Write the layers back to back into `out`. Returns the layout, or which layer failed.
 template <layer... L>
 constexpr nanom::expected<frame_layout<sizeof...(L)>, build_error> build_frame(mut_bytes out, const L&... ls) noexcept {
@@ -109,11 +122,12 @@ constexpr nanom::expected<frame_layout<sizeof...(L)>, build_error> build_frame(m
   const std::array<std::size_t, N> sz{std::size_t(ls.size())...};
   std::size_t total = 0;
   for (std::size_t i = 0; i < N; ++i) {
+    if (sz[i] > out.size() - total)
+      return nanom::unexpected<build_error>(build_error{build_errc::buffer_too_small, N});
     lay.layers[i] = {total, sz[i]};
     total += sz[i];
   }
   lay.size = total;
-  if (total > out.size()) return nanom::unexpected<build_error>(build_error{build_errc::buffer_too_small, N});
 
   std::array<build_ctx, N> ctx{};
   const auto tup = std::forward_as_tuple(ls...);
@@ -160,7 +174,9 @@ constexpr nanom::expected<frame_layout<sizeof...(L)>, build_error> build_frame(m
 /// Convenience: build into a new vector (allocates).
 template <layer... L>
 nanom::expected<std::vector<std::byte>, build_error> make_frame(const L&... ls) {
-  std::vector<std::byte> v(frame_size(ls...));
+  const auto total = detail::checked_frame_size(ls...);
+  if (!total) return nanom::unexpected<build_error>(build_error{build_errc::buffer_too_small, sizeof...(L)});
+  std::vector<std::byte> v(*total);
   auto r = build_frame(mut_bytes(v), ls...);
   if (!r) return nanom::unexpected<build_error>(r.error());
   return v;

@@ -108,13 +108,13 @@ class someip_view {
   constexpr bool is_sd() const noexcept { return message_id() == (u32(sd_service_id) << 16 | sd_method_id); }
 
   /// Declared size of the whole message (16 + payload) = 8 + length.
-  constexpr std::size_t message_size() const noexcept { return 8 + std::size_t(length()); }
-  constexpr bool truncated() const noexcept { return message_size() > n_; }
+  constexpr u64 message_size() const noexcept { return u64(8) + length(); }
+  constexpr bool truncated() const noexcept { return message_size() > u64(n_); }
   constexpr bytes header() const noexcept { return {p_, header_size}; }
   /// The message (header + payload) clamped to the available bytes.
   constexpr bytes message() const noexcept {
-    const std::size_t m = message_size();
-    return {p_, m < n_ ? m : n_};
+    const u64 m = message_size();
+    return {p_, m < u64(n_) ? std::size_t(m) : n_};
   }
   /// The payload after the 16-byte header (for a TP segment this starts with the TP header).
   constexpr bytes payload() const noexcept { return message().subspan(header_size); }
@@ -172,7 +172,7 @@ class someip_messages {
   static constexpr std::size_t next_size(bytes r) noexcept {
     if (r.size() < 16) return 0;
     const u32 l = detail::be32(r.data() + 4);
-    if (l < 8 || std::size_t(l) + 8 > r.size()) return 0;
+    if (l < 8 || std::size_t(l) > r.size() - 8) return 0;
     return std::size_t(l) + 8;
   }
 
@@ -221,7 +221,7 @@ struct someip {
       wire::someip_tp_hdr t{{tp->offset / 16}, {0}, {u8(tp->more)}};
       if (emit_wire(t, p + 16) != 4) return false;
     }
-    if (emit_wire(h, p, bytes(p + 16, (tp ? 4 : 0) + c.after)) != 16) return false;
+    if (emit_wire(h, p, length ? bytes{} : bytes(p + 16, (tp ? 4 : 0) + c.after)) != 16) return false;
     if (length) detail::put_be32(p + 4, *length);
     return true;
   }

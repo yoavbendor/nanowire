@@ -109,6 +109,8 @@ class reassembler {
   };
 
   explicit reassembler(reassembly_config cfg = {}, hooks h = {}) : cfg_(cfg), hooks_(h) {
+    constexpr std::size_t max_dg_limit = HeaderBytes >= 16 ? 0xFFFFFFF7u : 0xFFFFFFFEu;
+    if (cfg_.max_datagram > max_dg_limit) cfg_.max_datagram = max_dg_limit;
     cfg_.max_in_flight = std::clamp<std::size_t>(cfg_.max_in_flight, 1, 65535);
     cfg_.max_fragments = std::clamp<std::size_t>(cfg_.max_fragments, 1, 4096);
     if (cfg_.unit == 0) cfg_.unit = 1;
@@ -137,12 +139,14 @@ class reassembler {
     if (pending_release_) release_pending();
     ++stats_.fragments;
     result r;
+    if (data.size() > cfg_.max_datagram || offset > cfg_.max_datagram - data.size())
+      return drop_new(key, r, drop_reason::too_large);
     const std::size_t end = std::size_t(offset) + data.size();
-    if (end > cfg_.max_datagram) return drop_new(key, r, drop_reason::too_large);
+    if (more && data.empty()) return drop_new(key, r, drop_reason::inconsistent);
     if (more && cfg_.unit > 1 && data.size() % cfg_.unit != 0) {
       // drop the datagram this would have joined, too: it can never complete correctly
       const std::size_t h = Hash{}(key);
-      if (auto s = find(key, h)) kill(*s, drop_reason::misaligned);
+      if (auto s = find(key, h); s && slots_[*s].epoch == epoch) kill(*s, drop_reason::misaligned);
       return drop_new(key, r, drop_reason::misaligned);
     }
     const std::size_t h = Hash{}(key);
@@ -181,16 +185,29 @@ class reassembler {
       }
     }
     // end bookkeeping
+    const bool had_total = s.total != unknown;
     if (!more) {
-      if (s.total != unknown && s.total != end) return kill_with(si, r, drop_reason::inconsistent);
+      if (had_total && s.total != end) return kill_with(si, r, drop_reason::inconsistent);
       if (s.max_end > end) return kill_with(si, r, drop_reason::inconsistent);
       s.total = u32(end);
-    } else if (s.total != unknown && end > s.total) {
+    } else if (had_total && end > s.total) {
       return kill_with(si, r, drop_reason::inconsistent);
     }
     if (offset == 0) s.meta = meta;
 
+    // valid 0-byte terminal fragment (!more): no bytes to retain, never updates max_end
+    if (data.empty()) {
+      if (had_total) {
+        ++stats_.duplicates;
+        r.status = frag_status::duplicate;
+      } else {
+        r.status = frag_status::buffered;
+      }
+      return finish_check(si, r);
+    }
+
     // coverage update
+    const u32 prev_covered = s.covered;
     const auto added = cover(si, offset, data);
     if (added == cover_conflict) return kill_with(si, r, drop_reason::conflict);
     if (added == 0 && cfg_.overlap != overlap_policy::last_wins) {
@@ -198,10 +215,13 @@ class reassembler {
       r.status = frag_status::duplicate;
       return finish_check(si, r);
     }
-    if (s.nfrags >= cfg_.max_fragments) return kill_with(si, r, drop_reason::too_many_fragments);
+    if (s.nfrags >= cfg_.max_fragments) {
+      s.covered = prev_covered;
+      return kill_with(si, r, drop_reason::too_many_fragments);
+    }
     frags_[si * cfg_.max_fragments + s.nfrags++] = frag_rec{tok};
     r.retained = true;
-    s.max_end = std::max<u32>(s.max_end, u32(end));
+    if (!data.empty()) s.max_end = std::max<u32>(s.max_end, u32(end));
     r.status = frag_status::buffered;
     return finish_check(si, r);
   }

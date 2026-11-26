@@ -386,4 +386,112 @@ TEST(no_allocation_in_steady_state) {
   CHECK_EQ(done, 21u * 65);
 }
 
+TEST(regression_too_many_frags_bounds_empty_and_epoch) {
+  // 1. max_datagram clamping & overflow-safe offset + size check
+  {
+    reassembly_config c;
+    c.max_datagram = std::size_t(-1);
+    ipv4_reassembler r4(c);
+    CHECK_EQ(r4.config().max_datagram, 0xFFFFFFFEu);
+    someip_tp_reassembler rtp(c);
+    CHECK_EQ(rtp.config().max_datagram, 0xFFFFFFF7u);
+
+    const auto d = pattern(32);
+    auto ovf = r4.add(ipv4_frag_key{{1, 1, 1, 1}, {2, 2, 2, 2}, 17, 1}, 0, 0xFFFFFFF0u, false, d);
+    CHECK(ovf.status == frag_status::dropped && ovf.reason == drop_reason::too_large);
+    CHECK_EQ(r4.in_flight(), 0u);
+  }
+
+  // 2. too_many_fragments does not inflate hooks_.dropped bytes, and duplicate at limit still works
+  {
+    struct drop_info {
+      drop_reason why = drop_reason::none;
+      u32 bytes = 0;
+      u32 frags = 0;
+      int count = 0;
+    } info;
+    auto cfg = ip_reassembly_defaults();
+    cfg.max_fragments = 2;
+    ipv4_reassembler r(cfg, {nullptr,
+                             [](void* c, const ipv4_frag_key&, drop_reason why, u32 b, u32 f) {
+                               auto* di = static_cast<drop_info*>(c);
+                               di->why = why;
+                               di->bytes = b;
+                               di->frags = f;
+                               ++di->count;
+                             },
+                             &info});
+    const auto d = pattern(64);
+    CHECK(put(r, d, 0, 16, true).status == frag_status::buffered);
+    CHECK(put(r, d, 16, 16, true).status == frag_status::buffered);
+    // Exact duplicate at max_fragments is accepted as duplicate without killing slot
+    CHECK(put(r, d, 0, 16, true).status == frag_status::duplicate);
+    CHECK_EQ(info.count, 0);
+    // 3rd distinct fragment trips too_many_fragments with pre-fragment covered == 32 (not 48)
+    auto tm = put(r, d, 32, 16, true);
+    CHECK(tm.status == frag_status::dropped && tm.reason == drop_reason::too_many_fragments);
+    CHECK_EQ(info.count, 1);
+    CHECK(info.why == drop_reason::too_many_fragments);
+    CHECK_EQ(info.bytes, 32u);
+    CHECK_EQ(info.frags, 2u);
+  }
+
+  // 3. Empty non-last fragments rejected without allocating slot; 0-byte terminal fragment works cleanly
+  {
+    const auto d = pattern(32);
+    for (auto pol : {overlap_policy::reject_conflict, overlap_policy::last_wins}) {
+      auto cfg = ip_reassembly_defaults();
+      cfg.overlap = pol;
+      ipv4_reassembler r(cfg);
+      // Empty non-last fragment: dropped, no slot allocated
+      auto bad = r.add(ipv4_frag_key{{1, 1, 1, 1}, {2, 2, 2, 2}, 17, 1}, 0, 0, true, bytes{});
+      CHECK(bad.status == frag_status::dropped);
+      CHECK_EQ(r.in_flight(), 0u);
+
+      // Valid 0-byte terminal fragment arriving FIRST, then data -> completes without duplicate count
+      auto term = r.add(ipv4_frag_key{{1, 1, 1, 1}, {2, 2, 2, 2}, 17, 2}, 0, 16, false, bytes{});
+      CHECK(term.status == frag_status::buffered && !term.retained);
+      CHECK_EQ(r.stats().duplicates, 0u);
+      // Duplicate 0-byte terminal fragment increments duplicates
+      auto term_dup = r.add(ipv4_frag_key{{1, 1, 1, 1}, {2, 2, 2, 2}, 17, 2}, 0, 16, false, bytes{});
+      CHECK(term_dup.status == frag_status::duplicate);
+      CHECK_EQ(r.stats().duplicates, 1u);
+      auto body = r.add(ipv4_frag_key{{1, 1, 1, 1}, {2, 2, 2, 2}, 17, 2}, 0, 0, true, bytes(d).first(16));
+      CHECK(body.complete());
+      CHECK(materialize(body.parts) == std::vector<std::byte>(d.begin(), d.begin() + 16));
+
+      // Valid 0-byte terminal fragment arriving LAST -> completes without duplicate count
+      const u64 dup_before = r.stats().duplicates;
+      CHECK(put(r, d, 0, 16, true, 0, 0, 3).status == frag_status::buffered);
+      auto fin = r.add(ipv4_frag_key{{1, 1, 1, 1}, {2, 2, 2, 2}, 17, 3}, 0, 16, false, bytes{});
+      CHECK(fin.complete());
+      CHECK_EQ(r.stats().duplicates, dup_before);
+      CHECK(materialize(fin.parts) == std::vector<std::byte>(d.begin(), d.begin() + 16));
+
+      // 0-byte datagram
+      auto zero = r.add(ipv4_frag_key{{1, 1, 1, 1}, {2, 2, 2, 2}, 17, 4}, 0, 0, false, bytes{});
+      CHECK(zero.complete());
+      CHECK_EQ(zero.size(), 0u);
+      CHECK_EQ(r.stats().duplicates, dup_before);
+    }
+  }
+
+  // 4. Misaligned fragment from a different epoch must NOT kill the current epoch's slot
+  {
+    someip_tp_reassembler r(tp_reassembly_defaults());
+    const auto d = pattern(32);
+    someip_tp_key k{};
+    k.message_id = 0x12348001u;
+    std::array<std::byte, 16> hdr{};
+    CHECK(r.add(k, 0, 0, true, bytes(d).first(16), 1, /*epoch=*/2, 0, hdr).status == frag_status::buffered);
+    // Stray misaligned segment from old epoch 1
+    auto ma = r.add(k, 1, 0, true, bytes(d).first(10), 2, /*epoch=*/1, 0, hdr);
+    CHECK(ma.status == frag_status::dropped && ma.reason == drop_reason::misaligned);
+    CHECK_EQ(r.in_flight(), 1u);  // epoch 2 slot survived!
+    auto fin = r.add(k, 2, 16, false, bytes(d).subspan(16, 16), 3, /*epoch=*/2, 0, hdr);
+    CHECK(fin.complete());
+    CHECK_EQ(fin.size(), 16u + 32u);
+  }
+}
+
 TEST_MAIN()

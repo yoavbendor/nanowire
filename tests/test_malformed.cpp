@@ -229,4 +229,73 @@ TEST(reassemblers_on_mutated_fragments) {
   CHECK(tp.in_flight() <= tp.config().max_in_flight);
 }
 
+TEST(regression_vlan_cap_ipv6_guard_and_large_frag6_off) {
+  // 64 VLAN tags + IPv4 parses cleanly; 65 VLAN tags stops at 64 with malformed flag
+  {
+    std::vector<std::byte> f(14 + 65 * 4 + 20, std::byte{0});
+    detail::put_be16(f.data() + 12, ethertype::vlan);
+    for (std::size_t i = 0; i < 65; ++i) {
+      detail::put_be16(f.data() + 14 + 4 * i, u16(i + 1));
+      detail::put_be16(f.data() + 14 + 4 * i + 2, i < 64 ? ethertype::vlan : ethertype::ipv4);
+    }
+    const auto p65 = packet::parse(f);
+    CHECK(p65.is_malformed());
+    CHECK_EQ(p65.vlan_count(), 64u);
+    CHECK(p65.l3() == l3_kind::none);
+
+    // Change 64th tag's inner ethertype to IPv4 and put minimal IPv4 header after 64 tags
+    detail::put_be16(f.data() + 14 + 4 * 63 + 2, ethertype::ipv4);
+    f[14 + 4 * 64] = std::byte{0x45};
+    detail::put_be16(f.data() + 14 + 4 * 64 + 2, 20);
+    const auto p64 = packet::parse(f);
+    CHECK(!p64.is_malformed());
+    CHECK_EQ(p64.vlan_count(), 64u);
+    CHECK(p64.l3() == l3_kind::ipv4);
+  }
+
+  // 65 chained IPv6 extension headers -> hits 64-header guard and sets malformed
+  {
+    std::vector<std::byte> f(40 + 65 * 8, std::byte{0});
+    f[0] = std::byte{0x60};
+    detail::put_be16(f.data() + 4, u16(65 * 8));
+    f[6] = std::byte(ip_proto::ipv6_opts);
+    for (std::size_t i = 0; i < 65; ++i) {
+      f[40 + i * 8] = std::byte(i < 64 ? ip_proto::ipv6_opts : ip_proto::no_next);
+      f[40 + i * 8 + 1] = std::byte{0};  // 8 bytes each
+    }
+    const auto pkt = packet::parse(f, link_type::raw);
+    CHECK(pkt.l3() == l3_kind::ipv6);
+    CHECK(pkt.is_malformed());
+    CHECK(pkt.l4() == l4_kind::none);
+  }
+
+  // frag6_off_ >= 65536 (33 Destination Options headers of 2048 bytes each = 67584 bytes, then Fragment Header)
+  {
+    constexpr std::size_t nhdrs = 33;
+    constexpr std::size_t ext_len = 2048;  // hdr_ext_len = 255 -> (255 + 1) * 8 = 2048
+    constexpr std::size_t frag_off = 40 + nhdrs * ext_len;  // 67624 > 65535
+    std::vector<std::byte> f(frag_off + 8 + 16, std::byte{0});
+    f[0] = std::byte{0x60};
+    detail::put_be16(f.data() + 4, 0);  // payload_length == 0 -> jumbogram (to end of buffer)
+    f[6] = std::byte(ip_proto::ipv6_opts);
+    for (std::size_t i = 0; i < nhdrs; ++i) {
+      f[40 + i * ext_len] = std::byte(i + 1 < nhdrs ? ip_proto::ipv6_opts : ip_proto::ipv6_frag);
+      f[40 + i * ext_len + 1] = std::byte{255};
+    }
+    // Fragment Header at frag_off: next=17 (UDP), offset=2 (16 bytes), more=1, id=0x12345678
+    f[frag_off] = std::byte(ip_proto::udp);
+    detail::put_be16(f.data() + frag_off + 2, u16((2u << 3) | 1u));
+    detail::put_be32(f.data() + frag_off + 4, 0x12345678u);
+    const auto pkt = packet::parse(f, link_type::raw);
+    CHECK(!pkt.is_malformed());
+    CHECK(pkt.is_fragment());
+    auto fh = pkt.ipv6_fragment();
+    CHECK(fh.has_value());
+    CHECK_EQ(fh->identification(), 0x12345678u);
+    CHECK_EQ(fh->offset_bytes(), 16u);
+    CHECK(fh->more());
+    CHECK_EQ(pkt.fragment_data().size(), 16u);
+  }
+}
+
 TEST_MAIN()

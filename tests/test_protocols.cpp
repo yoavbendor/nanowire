@@ -444,4 +444,206 @@ TEST(raw_ip_link_types) {
   CHECK_EQ(packet::parse(g, link_type::ipv4).dst_port(), 7);
 }
 
+namespace {
+struct signed_bit_hdr {
+  nm::ibits<5> delta;
+  nm::ubits<3> tag;
+  nm::be<u16> val;
+};
+}  // namespace
+NANOM_DESCRIBE(signed_bit_hdr, delta, tag, val);
+
+TEST(regression_checksum_and_ipv4_parse) {
+  // constexpr checksum seam forwarding to nanom::inet::*
+  constexpr std::array<std::byte, 3> a{std::byte{0x12}, std::byte{0x34}, std::byte{0x56}};
+  constexpr std::array<std::byte, 2> b{std::byte{0x78}, std::byte{0x9a}};
+  constexpr std::array<std::byte, 5> ab{std::byte{0x12}, std::byte{0x34}, std::byte{0x56}, std::byte{0x78},
+                                        std::byte{0x9a}};
+  constexpr u64 split = detail::csum_add(detail::csum_add(0, a, false), b, true);
+  static_assert(detail::csum_fold(split) == detail::csum_fold(detail::csum_add(0, ab, false)));
+  static_assert(detail::internet_checksum(ab) == u16(~detail::csum_fold(split)));
+  static_assert(detail::checksum_update16(detail::internet_checksum(ab), 0x1234, 0x1235) ==
+                detail::internet_checksum(std::array<std::byte, 5>{std::byte{0x12}, std::byte{0x35}, std::byte{0x56},
+                                                                   std::byte{0x78}, std::byte{0x9a}}));
+  CHECK_EQ(detail::csum_fold(0x0000'0001'0000'ffffull), 0x0001u);
+
+  // parse_ipv4 rejects leading zeros
+  static_assert(parse_ipv4("0.0.0.0").has_value());
+  static_assert(!parse_ipv4("010.0.0.1").has_value());
+  static_assert(!parse_ipv4("00.0.0.1").has_value());
+  static_assert(!parse_ipv4("0001.2.3.4").has_value());
+  CHECK(!parse_ipv4("10.00.0.1"));
+  CHECK(!parse_ipv4("10.0.0.01"));
+}
+
+TEST(regression_patch_all_field_kinds) {
+  // bool into ubits<1>, plain u8 range check, byte array, be<u16> range check
+  std::array<std::byte, 20> ip{};
+  CHECK(patch<wire::ipv4_hdr, "df">(ip.data(), true));
+  CHECK_EQ((field<wire::ipv4_hdr, "df">(ip.data())), 1u);
+  CHECK(patch<wire::ipv4_hdr, "df">(ip.data(), false));
+  CHECK_EQ((field<wire::ipv4_hdr, "df">(ip.data())), 0u);
+  CHECK(patch<wire::ipv4_hdr, "ttl">(ip.data(), 64));
+  CHECK(!patch<wire::ipv4_hdr, "ttl">(ip.data(), 300));
+  CHECK(!patch<wire::ipv4_hdr, "ttl">(ip.data(), -1));
+  CHECK_EQ((field<wire::ipv4_hdr, "ttl">(ip.data())), 64u);
+  CHECK(!patch<wire::ipv4_hdr, "identification">(ip.data(), 70000));
+  CHECK(!patch<wire::ipv4_hdr, "identification">(ip.data(), -1));
+  CHECK(patch<wire::ipv4_hdr, "src">(ip.data(), ip4("10.20.30.40")));
+  CHECK(detail::load_array<4>(ip.data() + 12) == ip4("10.20.30.40"));
+
+  // signed ibits<5> (range [-16, 15]) + unsigned ubits<3>
+  std::array<std::byte, 3> sb{};
+  CHECK(patch<signed_bit_hdr, "tag">(sb.data(), 5));
+  CHECK(!patch<signed_bit_hdr, "tag">(sb.data(), -1));
+  CHECK(!patch<signed_bit_hdr, "tag">(sb.data(), 8));
+  CHECK(patch<signed_bit_hdr, "delta">(sb.data(), -16));
+  CHECK_EQ((field<signed_bit_hdr, "delta">(sb.data())), -16);
+  CHECK_EQ((field<signed_bit_hdr, "tag">(sb.data())), 5u);
+  CHECK(patch<signed_bit_hdr, "delta">(sb.data(), 15));
+  CHECK_EQ((field<signed_bit_hdr, "delta">(sb.data())), 15);
+  CHECK(!patch<signed_bit_hdr, "delta">(sb.data(), -17));
+  CHECK(!patch<signed_bit_hdr, "delta">(sb.data(), 16));
+}
+
+TEST(regression_build_overflow_and_length_overrides) {
+  constexpr std::size_t half_plus = std::size_t(-1) / 2 + 10;
+  CHECK_EQ(frame_size(fill{half_plus}, fill{half_plus}), std::size_t(-1));
+  std::array<std::byte, 64> buf{};
+  auto bf = build_frame(buf, fill{half_plus}, fill{half_plus});
+  CHECK(!bf && bf.error().code == build_errc::buffer_too_small);
+  auto mf = make_frame(fill{half_plus}, fill{half_plus});
+  CHECK(!mf && mf.error().code == build_errc::buffer_too_small);
+
+  // explicit length override with >65535-byte payload
+  auto big_ip = make_frame(ipv4{.src = ip4("10.0.0.1"), .dst = ip4("10.0.0.2"), .total_length = 40}, fill{70000});
+  CHECK(big_ip.has_value());
+  auto iv = ipv4_view::parse(*big_ip);
+  CHECK(iv && iv->total_length() == 40 && iv->checksum_ok());
+
+  auto big_udp = make_frame(udp{.src_port = 1, .dst_port = 2, .length = 16}, fill{70000});
+  CHECK(big_udp.has_value());
+  auto uv = udp_view::parse(*big_udp);
+  CHECK(uv && uv->length() == 16);
+}
+
+TEST(regression_ipv4_computed_ihl_underflow) {
+  wire::ipv4_hdr h{};
+  h.version = 4;
+  h.ihl = 0;  // < 5
+  const std::array<std::byte, 16> pl{std::byte{0xaa}, std::byte{0xbb}};
+  auto enc = nm::to_bytes(h, nm::emit_ctx{pl}, std::endian::big);
+  CHECK(enc.has_value());
+  // checksum must cover only the 20-byte header (0 option bytes), NOT the payload
+  CHECK_EQ(detail::internet_checksum(*enc), 0u);
+}
+
+TEST(regression_ipv6_defaults_srh_udp_zero_and_frag_ext) {
+  const std::array<std::byte, 8> pl{};
+  const std::array<ipv6_addr, 2> segs{ip6("fc00::1"), ip6("fc00::2")};
+
+  // default next_header = ip_proto::no_next (59), NOT 0 (hopopt)
+  CHECK_EQ(ipv6_view::parse(*make_frame(ipv6{}, raw{pl}))->next_header(), ip_proto::no_next);
+  {
+    auto f = *make_frame(ipv6{}, ipv6_frag{.id = 1}, raw{pl});
+    auto v = ipv6_view::parse(f);
+    CHECK(v && v->fragment() && v->fragment()->next_header() == ip_proto::no_next);
+  }
+  {
+    auto f = *make_frame(ipv6{}, ipv6_hbh{}, raw{pl});
+    auto v = ipv6_view::parse(f);
+    CHECK(v && v->next_header() == ip_proto::hopopt && v->upper_protocol() == ip_proto::no_next);
+  }
+  {
+    auto f = *make_frame(ipv6{}, ipv6_dstopts{}, raw{pl});
+    auto v = ipv6_view::parse(f);
+    CHECK(v && v->upper_protocol() == ip_proto::no_next);
+  }
+  {
+    auto f = *make_frame(ipv6{}, ipv6_srh{.segments = segs}, raw{pl});
+    auto v = ipv6_view::parse(f);
+    CHECK(v && v->upper_protocol() == ip_proto::no_next);
+  }
+
+  // SRv6 pseudo-header: segments_left == 0 must use ipv6.dst, NOT segment[0]
+  {
+    auto f0 = *make_frame(eth{}, ipv6{.src = ip6("fd00::1"), .dst = ip6("fd00::2")},
+                          ipv6_srh{.segments = segs, .segments_left = 0}, udp{.src_port = 100, .dst_port = 200},
+                          raw{pl});
+    auto pkt0 = packet::parse(f0);
+    const bytes l3 = pkt0.l3_bytes();
+    const bytes l4 = l3.subspan(pkt0.l4_offset() - 14);
+    CHECK(l4_checksum_ok(l3, ip_proto::udp, l4));
+    // Verify checksum matches ipv6.dst (fd00::2) directly, not segment[0] (fc00::1)
+    auto plain = *make_frame(ipv6{.src = ip6("fd00::1"), .dst = ip6("fd00::2")}, udp{.src_port = 100, .dst_port = 200},
+                             raw{pl});
+    CHECK_EQ(detail::be16(l4.data() + 6), detail::be16(plain.data() + 40 + 6));
+  }
+  // pseudo_header_sum ignores non-v4/v6 version nibble
+  {
+    std::array<std::byte, 40> bogus{};
+    bogus[0] = std::byte{0x50};
+    bogus[8] = std::byte{0xff};
+    CHECK_EQ(detail::pseudo_header_sum(bogus, ip_proto::udp, 8), u64(ip_proto::udp + 8));
+  }
+
+  // IPv6 UDP checksum == 0x0000 MUST fail l4_checksum_ok even if one's-complement sum is 0xFFFF
+  {
+    auto f = *make_frame(ipv6{.src = ip6("fd00::1"), .dst = ip6("fd00::2")},
+                         udp{.src_port = 100, .dst_port = 200, .checksum = 0}, fill{2});
+    // Adjust payload 2 bytes so that internet_checksum(udp_seg, pseudo_header_sum) == 0 with checksum field 0
+    bytes l3(f);
+    bytes seg(f.data() + 40, 10);
+    const u16 needed = detail::internet_checksum(seg, detail::pseudo_header_sum(l3, ip_proto::udp, seg.size()));
+    detail::put_be16(f.data() + 48, needed);
+    CHECK_EQ(detail::internet_checksum(bytes(f.data() + 40, 10), detail::pseudo_header_sum(f, ip_proto::udp, 10)), 0u);
+    CHECK(!l4_checksum_ok(f, ip_proto::udp, bytes(f.data() + 40, 10)));  // RFC 8200 8.1 rejects 0x0000
+    // Same datagram with checksum 0xFFFF verifies
+    detail::put_be16(f.data() + 46, 0xffff);
+    CHECK(l4_checksum_ok(f, ip_proto::udp, bytes(f.data() + 40, 10)));
+    // IPv4 UDP checksum == 0x0000 still verifies
+    auto v4 = *make_frame(ipv4{.src = ip4("10.0.0.1"), .dst = ip4("10.0.0.2")},
+                          udp{.src_port = 100, .dst_port = 200, .checksum = 0}, raw{pl});
+    CHECK(l4_checksum_ok(v4, ip_proto::udp, bytes(v4).subspan(20)));
+  }
+
+  // ipv6_ext_range and upper_layer stop after a non-first Fragment Header
+  {
+    // Fragment data starts with bytes that look like a Destination Options header (next=17, len=0)
+    const std::array<std::byte, 8> frag_payload{std::byte{17}, std::byte{0}, std::byte{1}, std::byte{2},
+                                                std::byte{3},  std::byte{4}, std::byte{5}, std::byte{6}};
+    auto f = *make_frame(ipv6{}, ipv6_frag{.offset = 2, .more = false, .id = 9, .next_header = ip_proto::ipv6_opts},
+                         raw{frag_payload});
+    auto v = ipv6_view::parse(f);
+    CHECK(v.has_value());
+    std::vector<u8> ext_types;
+    for (auto e : v->extensions()) ext_types.push_back(e.type());
+    CHECK((ext_types == std::vector<u8>{ip_proto::ipv6_frag}));
+    auto tail = v->extensions().upper_layer();
+    CHECK(tail.complete);
+    CHECK_EQ(tail.protocol, ip_proto::ipv6_opts);
+    CHECK_EQ(tail.offset, 8u);
+    CHECK_EQ(v->upper_payload().size(), 8u);
+  }
+}
+
+TEST(regression_someip_overflow_and_sd_config) {
+  // SOME/IP length near UINT32_MAX: message_size() computed in u64, next_size() does not wrap
+  auto raw_hdr = *make_frame(someip{.service_id = 1, .method_id = 2, .length = 0xFFFFFFFCu});
+  auto sv = someip_view::parse(raw_hdr);
+  CHECK(sv.has_value());
+  CHECK_EQ(sv->message_size(), u64(0x100000004ull));
+  CHECK(sv->truncated());
+  CHECK_EQ(sv->message().size(), 16u);
+  CHECK_EQ(sv->payload().size(), 0u);
+  CHECK_EQ(someip_messages::next_size(raw_hdr), 0u);
+  CHECK_EQ(someip_messages(raw_hdr).count(), 0u);
+  CHECK(!someip_messages(raw_hdr).well_formed());
+
+  // sd_encode_config rejects empty items
+  std::array<std::byte, 32> cfg{};
+  const std::array<std::string_view, 2> bad_items{"a=1", ""};
+  CHECK_EQ(sd_encode_config(bad_items, cfg), 0u);
+}
+
 TEST_MAIN()

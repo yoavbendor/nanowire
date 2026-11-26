@@ -315,7 +315,7 @@ class sd_view {
   }
   /// From a whole SOME/IP message; nullopt unless it is an SD message (0xFFFF / 0x8100).
   static constexpr std::optional<sd_view> parse(const someip_view& m) noexcept {
-    if (!m.is_sd()) return std::nullopt;
+    if (!m.is_sd() || m.is_tp()) return std::nullopt;
     return parse(m.payload());
   }
 
@@ -468,11 +468,11 @@ struct sd_option {
 };
 
 /// Encode configuration items ("key=value" strings) as [len][chars]... 0 into `out`; returns the
-/// size written, or 0 when an item is longer than 255 bytes or `out` is too small.
+/// size written, or 0 when an item is empty or longer than 255 bytes or `out` is too small.
 inline std::size_t sd_encode_config(std::span<const std::string_view> items, mut_bytes out) noexcept {
   std::size_t n = 0;
   for (auto it : items) {
-    if (it.size() > 255 || n + 1 + it.size() + 1 > out.size()) return 0;
+    if (it.empty() || it.size() > 255 || out.size() - n < it.size() + 2) return 0;
     out[n++] = std::byte(it.size());
     for (char ch : it) out[n++] = std::byte(ch);
   }
@@ -494,14 +494,17 @@ struct someip_sd {
   }
   constexpr std::size_t size() const noexcept { return 12 + 16 * entries.size() + options_size(); }
   constexpr bool write(std::byte* p, const build_ctx&) const noexcept {
+    if (entries.size() > 0xffffffffu / 16) return false;
     const std::size_t el = 16 * entries.size();
+    const std::size_t ol = options_size();
+    if (ol > 0xffffffffu) return false;
     if (emit_wire(wire::sd_header{flags, {0, 0, 0}, u32(el)}, p) != 8) return false;
     std::byte* q = p + 8;
     for (const auto& e : entries) {
       if (!e.write(q)) return false;
       q += 16;
     }
-    detail::put_be32(q, u32(options_size()));
+    detail::put_be32(q, u32(ol));
     q += 4;
     for (const auto& o : options) {
       if (!o.write(q)) return false;

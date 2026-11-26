@@ -84,13 +84,23 @@ template <class R, class... A>
 class handler<R(A...)> {
  public:
   handler() = default;
+  handler(handler&& other) noexcept : obj_(std::move(other.obj_)), call_(std::exchange(other.call_, nullptr)) {}
+  handler& operator=(handler&& other) noexcept {
+    if (this != &other) {
+      obj_ = std::move(other.obj_);
+      call_ = std::exchange(other.call_, nullptr);
+    }
+    return *this;
+  }
+  handler(const handler&) = delete;
+  handler& operator=(const handler&) = delete;
   template <class F>
     requires(!std::is_same_v<std::remove_cvref_t<F>, handler> && std::is_invocable_r_v<R, F&, A...>)
   handler(F f)  // NOLINT(google-explicit-constructor)
       : obj_(new F(std::move(f)), [](void* o) { delete static_cast<F*>(o); }),
         call_([](void* o, A... a) -> R { return (*static_cast<F*>(o))(std::forward<A>(a)...); }) {}
   R operator()(A... a) const { return call_(obj_.get(), std::forward<A>(a)...); }
-  explicit operator bool() const noexcept { return call_ != nullptr; }
+  explicit operator bool() const noexcept { return obj_ != nullptr && call_ != nullptr; }
 
  private:
   std::unique_ptr<void, void (*)(void*)> obj_{nullptr, [](void*) {}};
@@ -148,7 +158,7 @@ class registry {
   explicit registry(std::size_t scratch_bytes = 64 * 1024)
       : udp_(std::make_unique<std::array<app_protocol, 65536>>()),
         tcp_(std::make_unique<std::array<app_protocol, 65536>>()),
-        scratch_(scratch_bytes) {
+        scratch_(std::make_unique<std::vector<std::byte>>(scratch_bytes)) {
     udp_->fill(app_protocol::none);
     tcp_->fill(app_protocol::none);
     (*udp_)[port::someip_sd] = app_protocol::someip;
@@ -160,17 +170,39 @@ class registry {
     return *this;
   }
   registry& on_someip(u16 service, u16 method, someip_handler h) {
-    methods_.set(message_id(service, method), std::move(h));
+    if (!h) {
+      methods_.erase(message_id(service, method));
+    } else {
+      methods_.set(message_id(service, method),
+                   someip_entry([fn = std::move(h)](const someip_message& m) -> bool {
+                     fn(m);
+                     return true;
+                   }));
+    }
     return *this;
   }
   /// Every method of a service without a more specific handler.
   registry& on_service(u16 service, someip_handler h) {
-    services_.set(service, std::move(h));
+    if (!h) {
+      services_.erase(service);
+    } else {
+      services_.set(service, someip_entry([fn = std::move(h)](const someip_message& m) -> bool {
+                      fn(m);
+                      return true;
+                    }));
+    }
     return *this;
   }
   /// Fallback for SOME/IP messages nothing else handles.
   registry& on_someip_other(someip_handler h) {
-    other_someip_ = std::move(h);
+    if (!h) {
+      other_someip_ = {};
+    } else {
+      other_someip_ = someip_entry([fn = std::move(h)](const someip_message& m) -> bool {
+        fn(m);
+        return true;
+      });
+    }
     return *this;
   }
   registry& on_sd(sd_handler h) {
@@ -182,20 +214,26 @@ class registry {
   template <class T, class D, class F>
   registry& on_someip_payload(u16 service, u16 method, D decoder, F on_value) {
     nanom::dyn<T> dec = decoder;
-    std::vector<std::byte>* scratch = &scratch_;
-    return on_someip(service, method, [dec, on_value, scratch](const someip_message& m) mutable {
-      bytes in = m.payload;
-      if (m.segmented) {
-        const std::size_t n = copy_to(m.segments, mut_bytes(*scratch));
-        if (n != m.segments.size()) return;
-        in = bytes(scratch->data(), n);
-      }
-      auto r = dec(nanom::from(in));
-      if (r) on_value(m, r->value);
-    });
+    std::vector<std::byte>* scratch = scratch_.get();
+    methods_.set(message_id(service, method),
+                 someip_entry([dec = std::move(dec), on_value = std::move(on_value),
+                               scratch](const someip_message& m) mutable -> bool {
+                   bytes in = m.payload;
+                   if (m.segmented) {
+                     const std::size_t n = copy_to(m.segments, mut_bytes(*scratch));
+                     if (n != m.segments.size()) return false;
+                     in = bytes(scratch->data(), n);
+                   }
+                   auto r = dec(nanom::from(in));
+                   if (!r) return false;
+                   on_value(m, r->value);
+                   return true;
+                 }));
+    return *this;
   }
   registry& on_pdu(u32 id, pdu_handler h) {
-    pdus_.set(id, std::move(h));
+    if (!h) pdus_.erase(id);
+    else pdus_.set(id, std::move(h));
     return *this;
   }
   registry& on_pdu_other(pdu_handler h) {
@@ -215,8 +253,9 @@ class registry {
 
   // ---- lookup ----
   constexpr app_protocol classify(const packet& pkt) const noexcept {
-    const auto& t = pkt.l4() == l4_kind::tcp ? *tcp_ : *udp_;
+    if (pkt.is_fragment() || pkt.is_malformed()) return app_protocol::none;
     if (pkt.l4() != l4_kind::udp && pkt.l4() != l4_kind::tcp) return app_protocol::none;
+    const auto& t = pkt.l4() == l4_kind::tcp ? *tcp_ : *udp_;
     const app_protocol d = t[pkt.dst_port()];
     return d != app_protocol::none ? d : t[pkt.src_port()];
   }
@@ -238,12 +277,21 @@ class registry {
   }
 
  private:
+  using someip_entry = handler<bool(const someip_message&)>;
+
   void dispatch_someip(const packet& pkt, const someip_view& m, u64 now, u64 token, dispatch_stats& st) const {
     if (m.is_tp() && tp_) {
       ++st.tp_segments;
       auto r = feed(*tp_, pkt, m, now, token);
       if (!r.complete()) return;
       ++st.tp_completed;
+      struct release_guard {
+        someip_tp_reassembler* tp;
+        u32 id;
+        ~release_guard() {
+          if (tp && !tp->config().auto_release) tp->release(id);
+        }
+      } guard{tp_, r.id};
       const auto hdr = r.parts.part(0);
       someip_message msg;
       msg.pkt = &pkt;
@@ -265,9 +313,14 @@ class registry {
   void deliver(const someip_message& msg, dispatch_stats& st) const {
     ++st.messages;
     if (msg.header.is_sd()) {
-      if (sd_) {
+      if (sd_ && !msg.header.is_tp()) {
         std::optional<sd_view> sd;
-        if (!msg.segmented) sd = sd_view::parse(msg.payload);
+        if (!msg.segmented) {
+          sd = sd_view::parse(msg.payload);
+        } else {
+          const std::size_t n = copy_to(msg.segments, mut_bytes(*scratch_));
+          if (n == msg.segments.size()) sd = sd_view::parse(bytes(scratch_->data(), n));
+        }
         if (sd) {
           sd_(msg, *sd);
           ++st.handled;
@@ -275,15 +328,12 @@ class registry {
       }
       return;
     }
-    if (auto* h = methods_.find(msg.header.message_id())) {
-      (*h)(msg);
-      ++st.handled;
-    } else if (auto* s = services_.find(msg.header.service_id())) {
-      (*s)(msg);
-      ++st.handled;
+    if (auto* h = methods_.find(msg.header.message_id()); h && *h) {
+      if ((*h)(msg)) ++st.handled;
+    } else if (auto* s = services_.find(msg.header.service_id()); s && *s) {
+      if ((*s)(msg)) ++st.handled;
     } else if (other_someip_) {
-      other_someip_(msg);
-      ++st.handled;
+      if (other_someip_(msg)) ++st.handled;
     }
   }
   void dispatch_pdu(const packet& pkt, const pdu_view& p, u32 container, bool contained, dispatch_stats& st) const {
@@ -295,7 +345,7 @@ class registry {
       }
     }
     const pdu_message msg{&pkt, p.id, p.data, container, contained};
-    if (auto* h = pdus_.find(p.id)) {
+    if (auto* h = pdus_.find(p.id); h && *h) {
       (*h)(msg);
       ++st.handled;
     } else if (other_pdu_) {
@@ -305,15 +355,15 @@ class registry {
   }
 
   std::unique_ptr<std::array<app_protocol, 65536>> udp_, tcp_;
-  detail::flat_map<u32, someip_handler> methods_;
-  detail::flat_map<u16, someip_handler> services_;
+  detail::flat_map<u32, someip_entry> methods_;
+  detail::flat_map<u16, someip_entry> services_;
   detail::flat_map<u32, pdu_handler> pdus_;
   detail::flat_map<u32, ipdum_config> containers_;
-  someip_handler other_someip_;
+  someip_entry other_someip_;
   sd_handler sd_;
   pdu_handler other_pdu_;
   someip_tp_reassembler* tp_ = nullptr;
-  std::vector<std::byte> scratch_;
+  std::unique_ptr<std::vector<std::byte>> scratch_;
 };
 
 }  // namespace nanowire

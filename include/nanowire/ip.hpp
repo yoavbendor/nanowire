@@ -77,7 +77,8 @@ struct nanom::computed<nanowire::wire::ipv4_hdr> {
       nanom::calc<"total_length">(
           [](const nanowire::wire::ipv4_hdr&, const nanom::emit_ctx& c) { return 20 + c.payload.size(); }),
       nanom::checksum<"checksum">([](std::span<const std::byte> hdr, const nanom::emit_ctx& c) {
-        const std::size_t opt = static_cast<std::size_t>(std::to_integer<unsigned>(hdr[0]) & 0x0fu) * 4 - 20;
+        const std::size_t hl = static_cast<std::size_t>(std::to_integer<unsigned>(hdr[0]) & 0x0fu) * 4;
+        const std::size_t opt = hl > 20 ? hl - 20 : 0;
         const std::uint64_t acc = nanowire::detail::csum_add(0, hdr);
         return nanowire::detail::internet_checksum(c.payload.first(std::min(opt, c.payload.size())), acc);
       }),
@@ -353,10 +354,12 @@ class ipv6_ext_range {
     constexpr iterator(u8 nh, bytes rest) noexcept : nh_(nh), rest_(rest) { load(); }
     constexpr ipv6_ext_view operator*() const noexcept { return ipv6_ext_view(nh_, rest_.first(len_)); }
     constexpr iterator& operator++() noexcept {
+      const bool stop = (nh_ == ip_proto::ipv6_frag && (detail::be16(rest_.data() + 2) & 0xfff8) != 0);
       nh_ = u8(rest_[0]);
       rest_ = rest_.subspan(len_);
       ++count_;
-      load();
+      if (stop) len_ = 0;
+      else load();
       return *this;
     }
     constexpr iterator operator++(int) noexcept { auto t = *this; ++*this; return t; }
@@ -387,8 +390,10 @@ class ipv6_ext_range {
     for (unsigned k = 0; k < 64 && is_ipv6_extension(nh); ++k) {
       const std::size_t n = ipv6_ext_view::length_of(nh, b_.subspan(off));
       if (n == 0) return {nh, off, false};
+      const bool non_first_frag = (nh == ip_proto::ipv6_frag && (detail::be16(b_.data() + off + 2) & 0xfff8) != 0);
       nh = u8(b_[off]);
       off += n;
+      if (non_first_frag) return {nh, off, true};
     }
     return {nh, off, !is_ipv6_extension(nh)};
   }
@@ -475,20 +480,20 @@ struct ipv4 {
     if (on > 40 || dscp > 63 || ecn > 3 || frag_offset > 0x1fff) return false;
     for (std::size_t i = 0; i < on; ++i) p[20 + i] = i < options.size() ? options[i] : std::byte{0};
     wire::ipv4_hdr h{};
-    h.version = {4};
-    h.ihl = {u8(size() / 4)};
-    h.dscp = {dscp};
-    h.ecn = {ecn};
+    h.version = 4;
+    h.ihl = u8(size() / 4);
+    h.dscp = dscp;
+    h.ecn = ecn;
     h.identification = id;
-    h.df = {u8(df)};
-    h.mf = {u8(mf)};
-    h.frag_offset = {frag_offset};
+    h.df = u8(df);
+    h.mf = u8(mf);
+    h.frag_offset = frag_offset;
     h.ttl = ttl;
     h.protocol = protocol ? *protocol : c.next_ip_proto;
     h.src = src;
     h.dst = dst;
-    if (20 + on + c.after > 0xffff && !total_length) return false;
-    if (emit_wire(h, p, bytes(p + 20, on + c.after)) != 20) return false;
+    if (!total_length && c.after > 0xffffu - (20 + on)) return false;
+    if (emit_wire(h, p, total_length ? bytes(p + 20, on) : bytes(p + 20, on + c.after)) != 20) return false;
     if (total_length) {
       detail::put_be16(p + 2, *total_length);
       if (!checksum) {
@@ -516,11 +521,11 @@ struct ipv6 {
   constexpr bool write(std::byte* p, const build_ctx& c) const noexcept {
     if (flow_label > 0xfffff || (c.after > 0xffff && !payload_length)) return false;
     wire::ipv6_hdr h{};
-    h.version = {6};
-    h.traffic_class = {traffic_class};
-    h.flow_label = {flow_label};
+    h.version = 6;
+    h.traffic_class = traffic_class;
+    h.flow_label = flow_label;
     h.payload_length = payload_length ? *payload_length : u16(c.after);
-    h.next_header = next_header ? *next_header : c.next_ip_proto;
+    h.next_header = next_header ? *next_header : (c.has_next_ip_proto ? c.next_ip_proto : ip_proto::no_next);
     h.hop_limit = hop_limit;
     h.src = src;
     h.dst = dst;
@@ -539,7 +544,8 @@ struct ipv6_frag {
   static constexpr u8 ip_protocol() noexcept { return ip_proto::ipv6_frag; }
   constexpr bool write(std::byte* p, const build_ctx& c) const noexcept {
     if (offset > 0x1fff) return false;
-    wire::ipv6_frag_hdr h{next_header ? *next_header : c.next_ip_proto, 0, {offset}, {0}, {u8(more)}, id};
+    wire::ipv6_frag_hdr h{next_header ? *next_header : (c.has_next_ip_proto ? c.next_ip_proto : ip_proto::no_next), 0,
+                          {offset}, {0}, {u8(more)}, id};
     return emit_wire(h, p) == 8;
   }
 };
@@ -572,7 +578,8 @@ struct ipv6_hbh {
   constexpr std::size_t size() const noexcept { return detail::opts_ext_size(options); }
   static constexpr u8 ip_protocol() noexcept { return ip_proto::hopopt; }
   constexpr bool write(std::byte* p, const build_ctx& c) const noexcept {
-    return detail::write_opts_ext(p, next_header ? *next_header : c.next_ip_proto, options);
+    return detail::write_opts_ext(
+        p, next_header ? *next_header : (c.has_next_ip_proto ? c.next_ip_proto : ip_proto::no_next), options);
   }
 };
 /// Destination Options header.
@@ -582,7 +589,8 @@ struct ipv6_dstopts {
   constexpr std::size_t size() const noexcept { return detail::opts_ext_size(options); }
   static constexpr u8 ip_protocol() noexcept { return ip_proto::ipv6_opts; }
   constexpr bool write(std::byte* p, const build_ctx& c) const noexcept {
-    return detail::write_opts_ext(p, next_header ? *next_header : c.next_ip_proto, options);
+    return detail::write_opts_ext(
+        p, next_header ? *next_header : (c.has_next_ip_proto ? c.next_ip_proto : ip_proto::no_next), options);
   }
 };
 
@@ -599,7 +607,7 @@ struct ipv6_srh {
   static constexpr u8 ip_protocol() noexcept { return ip_proto::ipv6_route; }
   constexpr bool write(std::byte* p, const build_ctx& c) const noexcept {
     if (segments.empty() || segments.size() > 127) return false;
-    wire::ipv6_srh_hdr h{next_header ? *next_header : c.next_ip_proto,
+    wire::ipv6_srh_hdr h{next_header ? *next_header : (c.has_next_ip_proto ? c.next_ip_proto : ip_proto::no_next),
                          u8(segments.size() * 2),
                          4,
                          segments_left,

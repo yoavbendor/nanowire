@@ -185,6 +185,7 @@ struct soad_pdu {
   std::optional<u32> length{};  // override
   constexpr std::size_t size() const noexcept { return 8 + data.size(); }
   constexpr bool write(std::byte* p, const build_ctx&) const noexcept {
+    if (!length && data.size() > 0xffffffffu) return false;
     if (emit_wire(wire::soad_pdu_hdr{id, length ? *length : u32(data.size())}, p) != 8) return false;
     for (std::size_t i = 0; i < data.size(); ++i) p[8 + i] = data[i];
     return true;

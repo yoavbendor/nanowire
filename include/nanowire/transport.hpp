@@ -114,7 +114,7 @@ constexpr u64 pseudo_header_sum(bytes l3, u8 proto, std::size_t len) noexcept {
   u64 acc = 0;
   if (l3.size() >= 20 && (u8(l3[0]) >> 4) == 4) {
     acc = csum_add(acc, l3.subspan(12, 8));
-  } else if (l3.size() >= 40) {
+  } else if (l3.size() >= 40 && (u8(l3[0]) >> 4) == 6) {
     acc = csum_add(acc, l3.subspan(8, 16));
     bytes dst = l3.subspan(24, 16);
     u8 nh = u8(l3[6]);
@@ -122,7 +122,9 @@ constexpr u64 pseudo_header_sum(bytes l3, u8 proto, std::size_t len) noexcept {
     for (unsigned k = 0; k < 64 && is_ipv6_extension(nh); ++k) {
       const std::size_t n = ipv6_ext_view::length_of(nh, l3.subspan(off));
       if (n == 0) break;
-      if (nh == ip_proto::ipv6_route && u8(l3[off + 2]) == 4 && n >= 24) dst = l3.subspan(off + 8, 16);
+      if (nh == ip_proto::ipv6_route && u8(l3[off + 2]) == 4 && u8(l3[off + 3]) > 0 && n >= 24)
+        dst = l3.subspan(off + 8, 16);
+      if (nh == ip_proto::ipv6_frag && (detail::be16(l3.data() + off + 2) & 0xfff8) != 0) break;
       nh = u8(l3[off]);
       off += n;
     }
@@ -133,11 +135,14 @@ constexpr u64 pseudo_header_sum(bytes l3, u8 proto, std::size_t len) noexcept {
 }  // namespace detail
 
 /// Verify a UDP / TCP checksum given the enclosing IP datagram (`l3`, from the IP header on) and
-/// the whole L4 segment. A UDP checksum of 0 over IPv4 means "not computed" and verifies.
+/// the whole L4 segment. A UDP checksum of 0 over IPv4 means "not computed" and verifies;
+/// over IPv6 a UDP checksum of 0 is invalid (RFC 8200 8.1).
 constexpr bool l4_checksum_ok(bytes l3, u8 proto, bytes segment) noexcept {
-  if (proto == ip_proto::udp && segment.size() >= 8 && detail::be16(segment.data() + 6) == 0 && !l3.empty() &&
-      (u8(l3[0]) >> 4) == 4)
-    return true;
+  if (proto == ip_proto::udp && segment.size() >= 8 && detail::be16(segment.data() + 6) == 0 && !l3.empty()) {
+    const u8 ver = u8(l3[0]) >> 4;
+    if (ver == 4) return true;
+    if (ver == 6) return false;
+  }
   return detail::internet_checksum(segment, detail::pseudo_header_sum(l3, proto, segment.size())) == 0;
 }
 
@@ -156,9 +161,9 @@ struct udp {
   static constexpr std::size_t size() noexcept { return 8; }
   static constexpr u8 ip_protocol() noexcept { return ip_proto::udp; }
   constexpr bool write(std::byte* p, const build_ctx& c) const noexcept {
-    if (c.after + 8 > 0xffff && !length) return false;
+    if (!length && c.after > 0xffffu - 8) return false;
     wire::udp_hdr h{src_port, dst_port, 0, checksum ? *checksum : u16(0)};
-    if (emit_wire(h, p, bytes(p + 8, c.after)) != 8) return false;
+    if (emit_wire(h, p, length ? bytes{} : bytes(p + 8, c.after)) != 8) return false;
     if (length) detail::put_be16(p + 4, *length);
     return true;
   }

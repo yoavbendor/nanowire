@@ -135,8 +135,9 @@ constexpr std::optional<ipv4_addr> parse_ipv4(std::string_view s) noexcept {
       ++i;
     }
     unsigned v = 0, digits = 0;
+    const std::size_t start = i;
     while (i < s.size() && s[i] >= '0' && s[i] <= '9' && digits < 4) v = v * 10 + unsigned(s[i++] - '0'), ++digits;
-    if (digits == 0 || v > 255) return std::nullopt;
+    if (digits == 0 || (digits > 1 && s[start] == '0') || v > 255) return std::nullopt;
     a[k] = u8(v);
   }
   if (i != s.size()) return std::nullopt;
@@ -231,22 +232,24 @@ inline std::string to_string(const ipv6_addr& a) {  // uncompressed lower-case g
 // ---------------------------------------------------------------------------------------------
 // the nanom bridge: field access / patching by name on a described wire struct
 // ---------------------------------------------------------------------------------------------
-// (All use of nanom internals is confined to this block, so a nanom refactor touches one place.)
 
 /// Bit offset of field `Name` within wire struct W (msb0 from the struct start).
 template <nm::Described W, nm::fixed_string Name>
 inline constexpr std::size_t field_bit_offset_v = [] {
-  constexpr std::size_t I = nm::detail::field_index<W, Name>();
+  constexpr std::size_t I = nm::field_index<W, Name>();
   static_assert(I != std::size_t(-1), "nanowire: no such field in this wire struct");
-  return nm::detail::field_bit_offsets<W>()[I];
+  return nm::field_bit_offsets<W>()[I];
 }();
 /// Byte offset of the byte holding field `Name`'s first bit.
 template <nm::Described W, nm::fixed_string Name>
 inline constexpr std::size_t field_offset_v = field_bit_offset_v<W, Name> / 8;
 /// Width of field `Name` in bits.
 template <nm::Described W, nm::fixed_string Name>
-inline constexpr std::size_t field_bits_v =
-    nm::detail::wire<nm::detail::field_type_at<W, nm::detail::field_index<W, Name>()>>::bits;
+inline constexpr std::size_t field_bits_v = [] {
+  constexpr std::size_t I = nm::field_index<W, Name>();
+  static_assert(I != std::size_t(-1), "nanowire: no such field in this wire struct");
+  return nm::wire_bits_v<nm::field_type_t<W, I>>;
+}();
 
 /// Decode one field of wire struct W whose encoding starts at `p` (nanom's own decode; a be<u16>
 /// lowers to one load + bswap). The caller guarantees wire_size_v<W> readable bytes at p.
@@ -256,28 +259,11 @@ template <nm::Described W, nm::fixed_string Name>
 }
 
 /// Overwrite one field in place (template patching): be<> fields, ubits<> / ibits<> fields (other
-/// bits of shared bytes are preserved), byte arrays. Returns false when the value does not fit.
+/// bits of shared bytes are preserved), plain integrals, byte arrays. Returns false when the value
+/// does not fit.
 template <nm::Described W, nm::fixed_string Name, class V>
 constexpr bool patch(std::byte* p, const V& value) noexcept {
-  constexpr std::size_t I = nm::detail::field_index<W, Name>();
-  static_assert(I != std::size_t(-1), "nanowire: no such field in this wire struct");
-  using F = nm::detail::field_type_at<W, I>;
-  F f{};
-  if constexpr (std::is_same_v<F, V>) {
-    f = value;
-  } else if constexpr (requires { F::bits; F::order; }) {  // ubits / ibits
-    using VT = typename F::value_type;
-    if (!std::in_range<VT>(value)) return false;
-    if constexpr (std::is_unsigned_v<VT> && F::bits < 64)
-      if ((std::uint64_t(value) >> F::bits) != 0) return false;
-    f.v = VT(value);
-  } else if constexpr (requires { f.set(value); typename F::value_type; }) {  // be / le
-    if (!std::in_range<typename F::value_type>(value)) return false;
-    f.set(typename F::value_type(value));
-  } else {
-    f = F(value);
-  }
-  return nm::detail::emit_field<F>(f, p, field_bit_offset_v<W, Name>, std::endian::big) == nullptr;
+  return nm::mut_view<W>{p, std::endian::big}.template set<Name>(value).has_value();
 }
 
 /// Encode a wire struct (computed fields applied) into `out`; returns bytes written or 0 on error.
